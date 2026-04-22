@@ -646,70 +646,34 @@ def chunked_gae(
     return advantages, returns
 
 
-def _is_oom_error(exc: BaseException) -> bool:
-    if isinstance(exc, torch.cuda.OutOfMemoryError):
-        return True
-    return "out of memory" in str(exc).lower()
-
-
-def _compute_logprob_entropy_chunked(
-    logits: torch.Tensor,
-    tokens: torch.Tensor,
-    tp_group,
-    with_entropy: bool,
-    chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    # fused_vocab_parallel_cross_entropy may write into input tensor.
-    # In forward-only/no-grad phases we can skip clone to reduce memory peak.
-    need_clone = torch.is_grad_enabled()
-
-    num_chunks = (logits.size(0) - 1) // chunk_size + 1
-    tokens_chunks = tokens.chunk(num_chunks, dim=0)
-    logits_chunks = logits.chunk(num_chunks, dim=0)
-
-    log_probs = []
-    for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
-        logit_input = logits_chunk.clone() if need_clone else logits_chunk
-        log_prob = compute_log_probs(logit_input, tokens_chunk, tp_group)
-        log_probs.append(log_prob)
-    log_prob = torch.cat(log_probs, dim=0)
-
-    entropy = None
-    if with_entropy:
-        entropys = []
-        for logits_chunk in logits_chunks:
-            logit_input = logits_chunk.clone() if need_clone else logits_chunk
-            entropy_chunk = compute_entropy_from_logits(logit_input, tp_group)
-            entropys.append(entropy_chunk)
-        entropy = torch.cat(entropys, dim=0)
-
-    return log_prob, entropy
-
-
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
+    # TODO: not sure why we need to clone the logits here.
+    # Without the clone, the backward will trigger inplace edit error.
+    # It seems that the function with tp will modify the logits inplace.
+    entropy = None
     if logits.size(0) != 0:
-        effective_chunk_size = chunk_size if chunk_size > 0 else logits.size(0)
-        while True:
-            try:
-                log_prob, entropy = _compute_logprob_entropy_chunked(
-                    logits=logits,
-                    tokens=tokens,
-                    tp_group=tp_group,
-                    with_entropy=with_entropy,
-                    chunk_size=effective_chunk_size,
-                )
-                break
-            except RuntimeError as exc:
-                if not _is_oom_error(exc):
-                    raise
-                if effective_chunk_size <= 1:
-                    raise
-                torch.cuda.empty_cache()
-                effective_chunk_size = max(1, effective_chunk_size // 2)
+        if chunk_size > 0:
+            num_chunks = (logits.size(0) - 1) // chunk_size + 1
+            tokens_chunks = tokens.chunk(num_chunks, dim=0)
+            logits_chunks = logits.chunk(num_chunks, dim=0)
+            log_probs = []
+            for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+                log_probs.append(log_prob)
+            log_prob = torch.cat(log_probs, dim=0)
+            if with_entropy:
+                entropys = []
+                for _, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                    entropy = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
+                    entropys.append(entropy)
+                entropy = torch.cat(entropys, dim=0)
+        else:
+            log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+            if with_entropy:
+                entropy = compute_entropy_from_logits(logits.clone(), tp_group)
     else:
         log_prob = logits.new_zeros((0,))
-        entropy = None
         if with_entropy:
             entropy = logits.new_zeros((0,))
 

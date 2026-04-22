@@ -1,10 +1,8 @@
 import itertools
 import logging
 import multiprocessing
-import os
 import random
 import time
-from copy import copy
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +28,7 @@ from slime.utils.metric_utils import (
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
+from slime.utils.common import is_npu
 
 from ..utils.metric_utils import has_repetition
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -44,15 +43,12 @@ logger = logging.getLogger(__name__)
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
 
-    def __init__(self, args, pg, prm_pg=None):
+    def __init__(self, args, pg):
         configure_logger()
 
         self.args = args
         self.pg = pg
-        self.prm_pg = prm_pg
-        _start_router(args, router_ip_attr="sglang_router_ip", router_port_attr="sglang_router_port")
-        if self.args.prm_enable and self.args.prm_num_gpus > 0:
-            _start_router(args, router_ip_attr="prm_router_ip", router_port_attr="prm_router_port")
+        _start_router(args)
         # TODO make args immutable
         init_tracking(args, primary=False, router_addr=f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
         init_http_client(args)
@@ -80,16 +76,9 @@ class RolloutManager:
             num_engines = args.rollout_num_gpus // num_gpu_per_engine
             self.all_rollout_engines = [None] * num_engines
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
-        if self.args.prm_enable and self.args.prm_num_gpus > 0:
-            prm_num_gpu_per_engine = min(args.prm_num_gpus_per_engine, args.num_gpus_per_node)
-            prm_num_engines = args.prm_num_gpus // prm_num_gpu_per_engine
-            self.all_prm_engines = [None] * prm_num_engines
-            self.num_new_prm_engines = init_prm_engines(args, prm_pg, self.all_prm_engines)
-        else:
-            self.all_prm_engines = []
-            self.num_new_prm_engines = 0
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        device_name = "NPU" if is_npu() else "GPU"
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name: 0}).remote()
         self.rollout_id = -1
 
         self._metric_checker = MetricChecker.maybe_create(args)
@@ -132,14 +121,8 @@ class RolloutManager:
         # when doing multi-node serving, we will only send request to node-0 for each engine.
         return self.all_rollout_engines[:: self.nodes_per_engine]
 
-    def get_rollout_engines_and_lock(self, include_prm=False):
-        engines = list(self.rollout_engines)
-        num_new = self.num_new_engines
-        if include_prm:
-            prm_engines = [e for e in getattr(self, "all_prm_engines", []) if e is not None]
-            engines.extend(prm_engines)
-            num_new += getattr(self, "num_new_prm_engines", 0)
-        return engines, self.rollout_engine_lock, num_new
+    def get_rollout_engines_and_lock(self):
+        return self.rollout_engines, self.rollout_engine_lock, self.num_new_engines
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
@@ -217,8 +200,6 @@ class RolloutManager:
     def clear_num_new_engines(self):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
         self.num_new_engines = 0
-        if hasattr(self, "num_new_prm_engines"):
-            self.num_new_prm_engines = 0
 
     def health_monitoring_pause(self) -> None:
         if self._health_monitor is not None:
@@ -256,21 +237,10 @@ class RolloutManager:
 
             if not self.args.disable_rollout_trim_samples:
                 global_batch_size = self.args.global_batch_size
-                target_steps_per_rollout = getattr(self.args, "num_steps_per_rollout", None)
-                # dynamic_history can expand one rollout into many step-wise samples.
-                # In that case, honor num_steps_per_rollout by deriving a per-rollout
-                # dynamic global batch size from the actual collected sample count.
-                auto_dynamic_for_history = (
-                    getattr(self.args, "dynamic_history", False) and target_steps_per_rollout is not None
-                )
-                use_dynamic_gbs = self.args.use_dynamic_global_batch_size or auto_dynamic_for_history
-                dynamic_target_steps = target_steps_per_rollout if auto_dynamic_for_history else None
-                if use_dynamic_gbs:
+                if self.args.use_dynamic_global_batch_size:
                     logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
                     # TODO: this is a temporary solution, we should directly save dynamic_global_batch_size to rollout data
-                    self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(
-                        len(data), target_steps=dynamic_target_steps
-                    )
+                    self._dynamic_global_batch_size = self._compute_dynamic_global_batch_size(len(data))
                     global_batch_size = self._dynamic_global_batch_size
 
                 if len(data) % global_batch_size != 0:
@@ -284,35 +254,31 @@ class RolloutManager:
 
         return data, metrics
 
-    def _compute_dynamic_global_batch_size(self, num_samples: int, target_steps: int | None = None) -> int:
-        """Calculate dynamic global_batch_size from actual per-rollout samples.
+    def _compute_dynamic_global_batch_size(self, num_samples: int) -> int:
+        """Calculate dynamic global_batch_size to ensure only one training step.
 
-        If target_steps is provided, choose global_batch_size to keep the realized
-        number of training steps per rollout close to target_steps.
-        Otherwise fallback to one-step behavior for backward compatibility.
+        Strategy: global_batch_size = num_samples rounded down to a multiple of dp_size
+        This ensures num_steps_per_rollout = num_samples // global_batch_size = 1
         """
         dp_size = self.train_parallel_config["dp_size"]
         original_gbs = self.args.global_batch_size
 
-        desired_steps = int(target_steps) if target_steps is not None and target_steps > 0 else 1
-        # Target per-step samples, then round down to a multiple of dp_size.
-        per_step_target = max(1, num_samples // desired_steps)
-        dynamic_gbs = (per_step_target // dp_size) * dp_size
+        # Round down to a multiple of dp_size to ensure only one training step
+        dynamic_gbs = (num_samples // dp_size) * dp_size
 
         if dynamic_gbs == 0:
-            # Too few samples, use at least dp_size.
+            # Too few samples, use at least dp_size
             dynamic_gbs = dp_size
             logger.warning(f"num_samples={num_samples} < dp_size={dp_size}, using dp_size as global_batch_size")
 
-        realized_steps = max(1, num_samples // dynamic_gbs)
-        # Calculate how many samples will be discarded after trim.
-        wasted = num_samples % dynamic_gbs
+        # Calculate how many samples will be discarded
+        wasted = num_samples - dynamic_gbs
 
-        if dynamic_gbs != original_gbs or wasted > 0 or realized_steps != desired_steps:
+        if dynamic_gbs != original_gbs or wasted > 0:
             logger.info(
                 f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} "
                 f"(num_samples={num_samples}, dp_size={dp_size}, "
-                f"target_steps={desired_steps}, realized_steps={realized_steps}, wasted={wasted})"
+                f"num_steps=1, wasted={wasted})"
             )
 
         return dynamic_gbs
@@ -341,263 +307,27 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
-        rewards = list(raw_rewards)
-        if not self.args.rewards_normalization:
-            return raw_rewards, rewards
-
-        def normalize_vals(vals: torch.Tensor, std_normalization: bool = False) -> torch.Tensor:
-            vals = vals - vals.mean()
-            if std_normalization:
-                if len(vals) > 1:
-                    vals = vals / (vals.std() + 1e-6)
-                else:
-                    vals = torch.zeros_like(vals)
-            return vals
-
-        if self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]:
-            std_norm = (self.args.advantage_estimator in ["grpo", "gspo"]) and self.args.grpo_std_normalization
-            if getattr(self.args, "dynamic_history", False):
-                # dynamic_history + GRPO:
-                # normalize one outcome per trajectory inside each task(group),
-                # then broadcast that normalized value to all step samples in
-                # the same trajectory.
-                traj_reward_by_key: dict[tuple[int, int], float] = {}
-                group_to_keys: dict[int, list[tuple[int, int]]] = {}
-                key_by_sample: list[tuple[int, int]] = []
-                for i, sample in enumerate(samples):
-                    group_idx = int(sample.group_index) if sample.group_index is not None else -1
-                    traj_idx = int(sample.index) if sample.index is not None else i
-                    key = (group_idx, traj_idx)
-                    key_by_sample.append(key)
-                    if key not in traj_reward_by_key:
-                        traj_reward_by_key[key] = float(raw_rewards[i])
-                        group_to_keys.setdefault(group_idx, []).append(key)
-
-                normalized_by_key: dict[tuple[int, int], float] = {}
-                for _, keys in group_to_keys.items():
-                    vals = torch.tensor([traj_reward_by_key[k] for k in keys], dtype=torch.float32)
-                    vals = normalize_vals(vals, std_norm)
-                    for j, key in enumerate(keys):
-                        normalized_by_key[key] = float(vals[j].item())
-
-                rewards = [normalized_by_key[key] for key in key_by_sample]
+        if (
+            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+            and self.args.rewards_normalization
+        ):
+            # group norm
+            rewards = torch.tensor(raw_rewards, dtype=torch.float)
+            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
+                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
             else:
-                # non-dynamic_history + GRPO/GSPO:
-                # normalize reward directly inside each task(group).
-                group_to_indices: dict[int, list[int]] = {}
-                for i, sample in enumerate(samples):
-                    group_idx = int(sample.group_index) if sample.group_index is not None else -1
-                    group_to_indices.setdefault(group_idx, []).append(i)
+                # when samples count are not equal in each group
+                rewards = rewards.view(-1, rewards.shape[-1])
+            mean = rewards.mean(dim=-1, keepdim=True)
+            rewards = rewards - mean
 
-                for _, idxs in group_to_indices.items():
-                    vals = torch.tensor([raw_rewards[i] for i in idxs], dtype=torch.float32)
-                    vals = normalize_vals(vals, std_norm)
-                    for j, sample_idx in enumerate(idxs):
-                        rewards[sample_idx] = float(vals[j].item())
+            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                std = rewards.std(dim=-1, keepdim=True)
+                rewards = rewards / (std + 1e-6)
 
-        return raw_rewards, rewards
+            return raw_rewards, rewards.flatten().tolist()
 
-    def _drop_constant_reward_groups(self, samples: list[Sample]) -> list[Sample]:
-        """Drop GRPO/GSPO groups whose rewards are all identical.
-
-        Keep at least one group to avoid empty training data.
-        """
-        if not samples:
-            return samples
-        if self.args.advantage_estimator not in ["grpo", "gspo"] or not self.args.rewards_normalization:
-            return samples
-
-        raw_rewards = [float(sample.get_reward_value(self.args)) for sample in samples]
-        group_to_indices: dict[int, list[int]] = {}
-        for i, sample in enumerate(samples):
-            group_idx = int(sample.group_index) if sample.group_index is not None else -1
-            group_to_indices.setdefault(group_idx, []).append(i)
-
-        constant_groups: list[int] = []
-        for group_idx, idxs in group_to_indices.items():
-            vals = [raw_rewards[i] for i in idxs]
-            if len(vals) == 0:
-                continue
-            if max(vals) - min(vals) <= 1e-12:
-                constant_groups.append(group_idx)
-
-        if not constant_groups:
-            return samples
-
-        keep_groups = [g for g in group_to_indices.keys() if g not in set(constant_groups)]
-        dropped_groups = list(constant_groups)
-        if not keep_groups:
-            # Keep one full group so batch is never empty.
-            keep_group = next(iter(group_to_indices.keys()))
-            keep_groups = [keep_group]
-            dropped_groups = [g for g in constant_groups if g != keep_group]
-
-        keep_set = set(keep_groups)
-        filtered_samples = []
-        for sample in samples:
-            group_idx = int(sample.group_index) if sample.group_index is not None else -1
-            if group_idx in keep_set:
-                filtered_samples.append(sample)
-
-        if len(filtered_samples) != len(samples):
-            logger.warning(
-                "Dropped constant-reward groups for %s: dropped=%s kept=%s samples %d -> %d",
-                self.args.advantage_estimator,
-                dropped_groups,
-                keep_groups,
-                len(samples),
-                len(filtered_samples),
-            )
-        return filtered_samples
-
-    def _post_process_step_wise_rewards(
-        self, samples: list[Sample]
-    ) -> tuple[list[list[float]], list[list[list[int]]], list[list[int]], list[int]]:
-        """Build and normalize step-wise rewards metadata for training.
-
-        Returns:
-            step_wise_step_rewards, step_wise_step_token_spans, step_wise_step_indices, group_indices
-        """
-        step_wise_step_rewards: list[list[float]] = []
-        step_wise_step_token_spans: list[list[list[int]]] = []
-        step_wise_step_indices: list[list[int]] = []
-        group_indices: list[int] = []
-
-        for sample in samples:
-            step_wise_meta = (sample.metadata or {}).get("step_wise", {})
-            if not isinstance(step_wise_meta, dict):
-                step_wise_meta = {}
-
-            # Preferred field for step_wise: reward for each step has already
-            # been composed as (step_prm + outcome) in reward_func.
-            raw_step_rewards = step_wise_meta.get("step_scores_with_outcome") or step_wise_meta.get("step_scores", [])
-            raw_step_spans = step_wise_meta.get("step_token_spans", [])
-            raw_step_indices = step_wise_meta.get("step_indices", None)
-
-            if isinstance(raw_step_rewards, (tuple, list)):
-                step_rewards = [float(x) for x in raw_step_rewards]
-            else:
-                step_rewards = []
-            if isinstance(raw_step_indices, (tuple, list)):
-                step_indices = [int(x) for x in raw_step_indices]
-            else:
-                step_indices = list(range(len(step_rewards)))
-
-            step_spans = []
-            if isinstance(raw_step_spans, (tuple, list)):
-                for span in raw_step_spans:
-                    if (
-                        isinstance(span, (tuple, list))
-                        and len(span) == 2
-                        and span[0] is not None
-                        and span[1] is not None
-                    ):
-                        step_spans.append([int(span[0]), int(span[1])])
-
-            # dynamic_history mode may intentionally omit explicit step spans.
-            # In that case, infer one span from loss_mask (first/last 1).
-            if len(step_spans) == 0 and getattr(self.args, "dynamic_history", False) and sample.loss_mask is not None:
-                active_positions = [i for i, m in enumerate(sample.loss_mask) if int(m) == 1]
-                if active_positions:
-                    step_spans = [[active_positions[0], active_positions[-1] + 1]]
-                    if len(step_rewards) == 0:
-                        step_rewards = [float(sample.get_reward_value(self.args))]
-                    if len(step_indices) == 0:
-                        step_indices = [0]
-
-            if not (len(step_rewards) == len(step_spans) == len(step_indices)):
-                aligned_len = min(len(step_rewards), len(step_spans), len(step_indices))
-                logger.warning(
-                    "Step-wise metadata length mismatch for sample %s: rewards=%s spans=%s indices=%s, trim to %s",
-                    sample.index,
-                    len(step_rewards),
-                    len(step_spans),
-                    len(step_indices),
-                    aligned_len,
-                )
-                step_rewards = step_rewards[:aligned_len]
-                step_spans = step_spans[:aligned_len]
-                step_indices = step_indices[:aligned_len]
-
-            step_wise_step_rewards.append(step_rewards)
-            step_wise_step_token_spans.append(step_spans)
-            step_wise_step_indices.append(step_indices)
-            group_indices.append(int(sample.group_index) if sample.group_index is not None else -1)
-
-        # step_wise normalization is done in rollout for clarity:
-        # normalize within same (task group, step_index) across trajectories.
-        if self.args.rewards_normalization:
-            stats: dict[tuple[int, int], tuple[float, float, int]] = {}
-            for i, rewards_i in enumerate(step_wise_step_rewards):
-                group_idx = int(group_indices[i])
-                indices_i = step_wise_step_indices[i]
-                aligned_len = min(len(rewards_i), len(indices_i))
-                for pos in range(aligned_len):
-                    key = (group_idx, int(indices_i[pos]))
-                    v = float(rewards_i[pos])
-                    sum_v, sum_sq_v, count_v = stats.get(key, (0.0, 0.0, 0))
-                    stats[key] = (sum_v + v, sum_sq_v + v * v, count_v + 1)
-
-            # Drop constant normalization groups (same reward in one
-            # (group_index, step_index) bucket). Keep at least one group.
-            all_keys = list(stats.keys())
-            constant_keys: set[tuple[int, int]] = set()
-            for key, (sum_v, sum_sq_v, count_v) in stats.items():
-                if count_v <= 1:
-                    # Keep single-sample buckets: no normalization, use raw reward.
-                    continue
-                mean_v = sum_v / count_v
-                var_v = max(sum_sq_v / count_v - mean_v * mean_v, 0.0)
-                if var_v <= 1e-12:
-                    constant_keys.add(key)
-
-            kept_keys = [k for k in all_keys if k not in constant_keys]
-            dropped_keys = list(constant_keys)
-            if not kept_keys and all_keys:
-                keep_key = all_keys[0]
-                kept_keys = [keep_key]
-                dropped_keys = [k for k in dropped_keys if k != keep_key]
-
-            kept_key_set = set(kept_keys)
-
-            for i, rewards_i in enumerate(step_wise_step_rewards):
-                group_idx = int(group_indices[i])
-                indices_i = step_wise_step_indices[i]
-                spans_i = step_wise_step_token_spans[i]
-                aligned_len = min(len(rewards_i), len(indices_i))
-                normalized_i = []
-                filtered_indices_i = []
-                filtered_spans_i = []
-                for pos in range(aligned_len):
-                    key = (group_idx, int(indices_i[pos]))
-                    if key not in kept_key_set:
-                        continue
-                    sum_v, sum_sq_v, count_v = stats[key]
-                    v = float(rewards_i[pos])
-                    if count_v > 1:
-                        mean_v = sum_v / count_v
-                        var_v = max(sum_sq_v / count_v - mean_v * mean_v, 0.0)
-                        std_v = var_v**0.5
-                        v = (v - mean_v) / (std_v + 1e-6)
-                    normalized_i.append(v)
-                    filtered_indices_i.append(int(indices_i[pos]))
-                    filtered_spans_i.append(spans_i[pos])
-                step_wise_step_rewards[i] = normalized_i
-                step_wise_step_indices[i] = filtered_indices_i
-                step_wise_step_token_spans[i] = filtered_spans_i
-
-                # If this sample loses all step entries, mark it as non-trainable.
-                if len(normalized_i) == 0:
-                    samples[i].remove_sample = True
-
-            if dropped_keys:
-                logger.warning(
-                    "Dropped constant step_wise groups: dropped=%s kept=%s",
-                    dropped_keys,
-                    kept_keys,
-                )
-
-        return step_wise_step_rewards, step_wise_step_token_spans, step_wise_step_indices, group_indices
+        return raw_rewards, raw_rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
@@ -605,56 +335,6 @@ class RolloutManager:
         """
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
-
-        # TODO: This logic should be moved to the sample builder
-        def _mark_removed_samples(samples: list[Sample]) -> None:
-            if any(sample.multimodal_train_inputs is not None for sample in samples):
-                missing_mm_indices = []
-                for sample in samples:
-                    if sample.multimodal_train_inputs is None and not sample.remove_sample:
-                        sample.remove_sample = True
-                        missing_mm_indices.append(sample.index)
-                if missing_mm_indices:
-                    logger.warning(
-                        "Marked %d samples as non-trainable due to missing multimodal_train_inputs: indices=%s",
-                        len(missing_mm_indices),
-                        missing_mm_indices[:20],
-                    )
-
-        def _drop_removed_samples(samples: list[Sample]) -> list[Sample]:
-            """
-            Drop sample if it is marked as removed.
-            """
-            return [sample for sample in samples if not sample.remove_sample]
-
-        def _make_dummy_samples(count: int) -> list[Sample]:
-            reward = {self.args.reward_key or "score": 0.0}
-            return [
-                Sample(
-                    group_index=-(i + 1),
-                    index=-(i + 1),
-                    tokens=[0, 0],
-                    response_length=1,
-                    loss_mask=[0],
-                    rollout_log_probs=[0.0],
-                    reward=reward,
-                    remove_sample=True,
-                    status=Sample.Status.FAILED,
-                    metadata={"dummy_removed_sample": True},
-                )
-                for i in range(count)
-            ]
-
-        _mark_removed_samples(samples)
-        samples = _drop_removed_samples(samples)
-        samples = self._drop_constant_reward_groups(samples)
-        dp_size = self.train_parallel_config["dp_size"]
-        if len(samples) < dp_size:
-            logger.warning(
-                "Injecting %d dummy samples.",
-                dp_size - len(samples),
-            )
-            samples.extend(_make_dummy_samples(dp_size - len(samples)))
 
         raw_rewards, rewards = self._post_process_rewards(samples)
 
@@ -669,21 +349,8 @@ class RolloutManager:
             "rewards": rewards,
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
-            "group_indices": [sample.group_index for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
-
-        if self.args.advantage_estimator == "step_wise":
-            (
-                step_wise_step_rewards,
-                step_wise_step_token_spans,
-                step_wise_step_indices,
-                group_indices,
-            ) = self._post_process_step_wise_rewards(samples)
-
-            train_data["step_wise_step_rewards"] = step_wise_step_rewards
-            train_data["step_wise_step_token_spans"] = step_wise_step_token_spans
-            train_data["step_wise_step_indices"] = step_wise_step_indices
 
         # loss mask
         # TODO: compress the loss mask
@@ -719,21 +386,11 @@ class RolloutManager:
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
 
-        if any(sample.multimodal_train_inputs is not None for sample in samples):
+        if samples[0].multimodal_train_inputs is not None:
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
-
-        if "teacher_tokens" in samples[0].__dict__:
-            train_data["teacher_tokens"] = [sample.teacher_tokens for sample in samples]
-            train_data["teacher_total_lengths"] = [len(sample.teacher_tokens) for sample in samples]
-
-        if "teacher_topk_log_probs" in samples[0].__dict__:
-            train_data["teacher_topk_log_probs"] = [sample.teacher_topk_log_probs for sample in samples]
-
-        if "teacher_topk_indices" in samples[0].__dict__:
-            train_data["teacher_topk_indices"] = [sample.teacher_topk_indices for sample in samples]
 
         return train_data
 
@@ -751,17 +408,7 @@ class RolloutManager:
         data["total_lengths"] = total_lengths
 
         if self.args.balance_data:
-            # Equal-size partitioning requires divisibility by dp_size.
-            # Dynamic rollout/history can produce tail batches that violate this.
-            use_equal_size = (len(total_lengths) % dp_size) == 0
-            if not use_equal_size:
-                logger.warning(
-                    "balance-data fallback: num_samples=%d is not divisible by dp_size=%d; "
-                    "using unequal-size seqlen balancing for this rollout step.",
-                    len(total_lengths),
-                    dp_size,
-                )
-            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=use_equal_size)
+            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
         else:
             partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
 
@@ -780,18 +427,10 @@ class RolloutManager:
                 "loss_masks",
                 "round_number",
                 "sample_indices",
-                "group_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
-                "teacher_tokens",
-                "teacher_total_lengths",
-                "teacher_topk_log_probs",
-                "teacher_topk_indices",
-                "step_wise_step_rewards",
-                "step_wise_step_token_spans",
-                "step_wise_step_indices",
             ]:
                 if key not in data:
                     continue
@@ -830,6 +469,7 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     RolloutRayActor = ray.remote(SGLangEngine)
 
     rollout_engines = []
+    device_name = "NPU" if is_npu() else "GPU"
     for i in range(num_engines):
         if all_rollout_engines[i] is not None:
             continue
@@ -847,16 +487,14 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         )
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-            key: os.environ.get(key, default_val)
-            for key, default_val in {
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-                "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-            }.items()
+            "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
+            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+            "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
         }
 
         worker_type = "regular"
@@ -868,11 +506,11 @@ def init_rollout_engines(args, pg, all_rollout_engines):
 
         rollout_engine = RolloutRayActor.options(
             num_cpus=num_cpus,
-            num_gpus=num_gpus,
             scheduling_strategy=scheduling_strategy,
             runtime_env={
                 "env_vars": env_vars,
             },
+            resources={device_name: num_gpus}
         ).remote(args, rank=i, worker_type=worker_type, base_gpu_id=base_gpu_id)
 
         rollout_engines.append((i, rollout_engine))
@@ -898,69 +536,6 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     return num_new_engines
 
 
-def init_prm_engines(args, pg, all_prm_engines):
-    if not args.prm_enable or args.prm_num_gpus <= 0:
-        return 0
-    assert pg is not None, "PRM placement group is required when PRM is enabled."
-
-    num_gpu_per_engine = min(args.prm_num_gpus_per_engine, args.num_gpus_per_node)
-    num_engines = args.prm_num_gpus // num_gpu_per_engine
-    assert len(all_prm_engines) == num_engines
-
-    pg, reordered_bundle_indices, reordered_gpu_ids = pg
-    RolloutRayActor = ray.remote(SGLangEngine)
-
-    prm_engines = []
-    for i in range(num_engines):
-        if all_prm_engines[i] is not None:
-            continue
-
-        num_gpus = 0.2
-        num_cpus = num_gpus
-        base_gpu_id = int(reordered_gpu_ids[i * num_gpu_per_engine])
-        scheduling_strategy = PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=reordered_bundle_indices[i * num_gpu_per_engine],
-        )
-
-        env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-            key: os.environ.get(key, default_val)
-            for key, default_val in {
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-                "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-            }.items()
-        }
-
-        prm_engine = RolloutRayActor.options(
-            num_cpus=num_cpus,
-            num_gpus=num_gpus,
-            scheduling_strategy=scheduling_strategy,
-            runtime_env={"env_vars": env_vars},
-        ).remote(args, rank=i, worker_type="regular", base_gpu_id=base_gpu_id, engine_role="prm")
-
-        prm_engines.append((i, prm_engine))
-        all_prm_engines[i] = prm_engine
-
-    num_new_engines = len(prm_engines)
-    if num_new_engines == 0:
-        return num_new_engines
-
-    addr_and_ports = _allocate_prm_engine_addr_and_ports(
-        args=args,
-        num_engines=num_engines,
-        prm_engines=prm_engines,
-    )
-    init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in prm_engines]
-    ray.get(init_handles)
-    return num_new_engines
-
-
 def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
     addr_and_ports = []
     for rank, _ in rollout_engines:
@@ -974,62 +549,6 @@ def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
                 port=int(port),
             )
         )
-    return addr_and_ports
-
-
-def _allocate_prm_engine_addr_and_ports(*, args, num_engines, prm_engines):
-    # mirror rollout allocator but use PRM engine parallel settings.
-    num_engines_per_node = max(1, min(args.num_gpus_per_node, args.prm_num_gpus) // args.prm_num_gpus_per_engine)
-    addr_and_ports = [{} for _ in range(num_engines)]
-
-    visited_nodes = set()
-    for rank, engine in prm_engines:
-        if rank // num_engines_per_node in visited_nodes:
-            continue
-        visited_nodes.add(rank // num_engines_per_node)
-        num_engines_on_this_node = num_engines_per_node - (rank % num_engines_per_node)
-
-        def get_addr_and_ports(engine):
-            start_port = 25000
-
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                return port
-
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine)
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-        if args.prm_num_gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = args.prm_num_gpus_per_engine // args.num_gpus_per_node
-            if rank % num_node_per_engine == 0:
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
-        else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
-    for i, _ in prm_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"PRM Engine {i} {key} is not set."
-        logger.info(f"Ports for PRM engine {i}: {addr_and_ports[i]}")
     return addr_and_ports
 
 
@@ -1112,23 +631,20 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
     return addr_and_ports
 
 
-def _start_router(args, router_ip_attr: str, router_port_attr: str):
-    """Start a router for rollout or PRM engines."""
-    if getattr(args, router_ip_attr, None) is not None:
+def _start_router(args):
+    """start sgl router and slime router"""
+    if args.sglang_router_ip is not None:
         return
 
-    setattr(args, router_ip_attr, _wrap_ipv6(get_host_info()[1]))
-    if getattr(args, router_port_attr, None) is None:
-        setattr(args, router_port_attr, find_available_port(random.randint(3000, 4000)))
+    args.sglang_router_ip = _wrap_ipv6(get_host_info()[1])
+    if args.sglang_router_port is None:
+        args.sglang_router_port = find_available_port(random.randint(3000, 4000))
 
     if args.use_slime_router:
-        if router_ip_attr == "sglang_router_ip":
-            assert args.prefill_num_servers is None, "slime router does not support prefill_num_servers."
+        assert args.prefill_num_servers is None, "slime router does not support prefill_num_servers."
         from slime.router.router import run_router
 
-        router_args = copy(args)
-        router_args.sglang_router_ip = getattr(args, router_ip_attr)
-        router_args.sglang_router_port = getattr(args, router_port_attr)
+        router_args = args
 
     else:
         from sglang_router.launch_router import RouterArgs
@@ -1136,13 +652,13 @@ def _start_router(args, router_ip_attr: str, router_port_attr: str):
         from slime.utils.http_utils import run_router
 
         router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = getattr(args, router_ip_attr)
-        router_args.port = getattr(args, router_port_attr)
+        router_args.host = args.sglang_router_ip
+        router_args.port = args.sglang_router_port
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
-        if router_ip_attr == "sglang_router_ip" and args.prefill_num_servers is not None:
+        if args.prefill_num_servers is not None:
             router_args.pd_disaggregation = True
 
         logger.info(f"Launch router with args: {router_args}")
@@ -1156,7 +672,7 @@ def _start_router(args, router_ip_attr: str, router_port_attr: str):
     # Wait 3 seconds
     time.sleep(3)
     assert process.is_alive()
-    logger.info(f"Router launched at {getattr(args, router_ip_attr)}:{getattr(args, router_port_attr)}")
+    logger.info(f"Router launched at {args.sglang_router_ip}:{args.sglang_router_port}")
 
 
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
@@ -1170,11 +686,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            sample_metrics = compute_metrics_from_samples(args, samples)
-            sample_metrics = {k: v for k, v in sample_metrics.items() if not k.startswith("zero_std/")}
-            log_dict |= dict_add_prefix(sample_metrics, f"eval/{key}/")
-            aborted = [s for s in samples if s.status == Sample.Status.ABORTED]
-            log_dict[f"eval/{key}-aborted_ratio"] = len(aborted) / len(samples)
+            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)

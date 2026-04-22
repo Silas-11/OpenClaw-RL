@@ -1,7 +1,6 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
-import re
 from contextlib import nullcontext
 from typing import Literal
 
@@ -18,6 +17,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.misc import load_function
+import slime_plugins.patch.mbridge_patch
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -34,9 +34,7 @@ class LinearForLastLayer(torch.nn.Linear):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
             self.weight.sequence_parallel = True
-            if bias:
-                self.bias.sequence_parallel = True
-
+            self.bias.sequence_parallel = True
         self.weight.data.normal_(mean=0.0, std=0.02)
         if bias:
             self.bias.data.zero_()
@@ -54,10 +52,59 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def get_qwen3vl_provide_wrapper(provider, role):
+
+    def provide_wrapper(pre_process=None, post_process=None, vp_stage=None):
+        """
+        Provide a Qwen3VL MoE model instance with vision and language components.
+        """
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+        language_transformer_config = provider
+
+        # Create vision transformer config - placeholder for future use
+        hf_config = provider.vision_config
+
+        language_transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=provider.num_moe_experts,
+            moe_grouped_gemm=True,
+            qk_layernorm=provider.qk_layernorm,
+            fp8=False,
+            normalization="RMSNorm",
+        )
+
+        # reuse Qwen3VLModel for MoE model but replace the language model with MoE language model
+        model = Qwen3VLModel(
+            language_transformer_config=language_transformer_config,
+            language_transformer_layer_spec=language_transformer_layer_spec,
+            vision_transformer_config=hf_config,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
+
+        if role == "critic" and post_process:
+            model.language_model.output_layer = LinearForLastLayer(input_size=provider.hidden_size, output_size=1, config=provider).to(
+                device=model.language_model.output_layer.weight.device,
+                dtype=model.language_model.output_layer.weight.dtype,
+            )
+
+        # Apply freeze options if any are enabled for fine-tuning
+        if provider.freeze_language_model or provider.freeze_vision_model or provider.freeze_vision_projection:
+            model.freeze(
+                freeze_language_model=provider.freeze_language_model,
+                freeze_vision_model=provider.freeze_vision_model,
+                freeze_vision_projection=provider.freeze_vision_projection,
+            )
+
+        return model
+    return provide_wrapper
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    AutoMapping.register_module_type('LinearForLastLayer', 'replicated')  # 或 'column' / 'replicated'
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -81,95 +128,37 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        bridge, hf_pretrained, is_local_bridge = load_function(
-            "slime.utils.megatron_bridge_utils.build_bridge_for_hf_checkpoint"
-        )(args.hf_checkpoint, load_weights=False)
-        if is_local_bridge:
-            provider = bridge.provider_bridge(hf_pretrained)
-        else:
-            provider = bridge.to_megatron_provider(load_weights=False)
-        print(
-            "Qwen35 bridge debug: "
-            f"bridge={type(bridge).__module__}.{type(bridge).__name__} "
-            f"provider={type(provider).__module__}.{type(provider).__name__} "
-            f"is_local_bridge={is_local_bridge}"
-        )
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
         provider.expert_model_parallel_size = args.expert_model_parallel_size
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
-        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-        # Bridge providers are constructed from HF config and ignore most CLI flags
-        # forwarded to TransformerConfig in the raw path. Activation-recompute is
-        # the most consequential one: without it, full activations stay resident
-        # for every layer and large-context RL runs OOM. Forward it explicitly so
-        # bridge runs are at least memory-comparable to raw runs.
-        if getattr(args, "recompute_granularity", None) is not None:
-            provider.recompute_granularity = args.recompute_granularity
-            provider.recompute_method = args.recompute_method
-            provider.recompute_num_layers = args.recompute_num_layers
+        provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        # Recompute settings - enable these if memory is insufficient
+        # provider.recompute_granularity = args.recompute_granularity
+        # provider.recompute_method = args.recompute_method
+        # provider.recompute_num_layers = args.recompute_num_layers
+        for key, value in vars(args).items():
+            if hasattr(provider, key):
+                continue
+            setattr(provider, key, value)
 
-        # CLI flags that materially affect train numerics/quality and per-step
-        # speed but are NOT derivable from the HF config. Without these, bridge
-        # mode silently keeps HF-config defaults (e.g. attention_dropout=0.1
-        # for many Qwen configs), which causes train-vs-inference distribution
-        # skew and biased GRPO importance sampling. Forward only attributes the
-        # provider already exposes so we don't break providers that omit them.
-        _BRIDGE_FORWARDED_ARGS = (
-            # numerics / quality
-            "attention_dropout",
-            "hidden_dropout",
-            "attention_softmax_in_fp32",
-            
-            "accumulate_allreduce_grads_in_fp32",
-            "fp16_lm_cross_entropy",
-            "cross_entropy_loss_fusion",
-            "cross_entropy_fusion_impl",
-            # kernels / fused ops (perf, occasionally numerics)
-            "attention_backend",
-            "apply_rope_fusion",
-            "bias_swiglu_fusion",
-            "bias_dropout_fusion",
-            "bias_gelu_fusion",
-            "masked_softmax_fusion",
-            "gradient_accumulation_fusion",
-            "async_tensor_model_parallel_allreduce",
-            "tp_comm_overlap",
-            # context-parallel / sequence-parallel related
-            "context_parallel_size",
-            # dtype / precision
-            "params_dtype",
-            "bf16",
-            "fp16",
+        is_qwen3vl = (
+            hasattr(bridge.hf_pretrained, 'config') 
+            and hasattr(bridge.hf_pretrained.config, 'model_type') 
+            and 'qwen3_vl' in bridge.hf_pretrained.config.model_type.lower()
         )
-        forwarded = []
-        skipped = []
-        for name in _BRIDGE_FORWARDED_ARGS:
-            if not hasattr(args, name):
-                continue
-            value = getattr(args, name)
-            if value is None:
-                continue
-            if not hasattr(provider, name):
-                skipped.append(name)
-                continue
-            setattr(provider, name, value)
-            forwarded.append((name, value))
-        if forwarded:
-            print(
-                "Bridge provider: forwarded CLI flags -> "
-                + ", ".join(f"{n}={v}" for n, v in forwarded)
-            )
-        if skipped:
-            print(
-                "Bridge provider: skipped CLI flags not exposed by provider -> "
-                + ", ".join(skipped)
-            )
+
+        if role == 'critic' and is_qwen3vl:
+            from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+            from slime_plugins.patch.critic_patch import load_weights_hf_to_megatron_wrapper
+            MegatronModelBridge.load_weights_hf_to_megatron = load_weights_hf_to_megatron_wrapper
+            provider.provide = get_qwen3vl_provide_wrapper(provider, role)
 
         provider.finalize()
         return provider.provide
@@ -282,45 +271,3 @@ def get_model_provider_func(
         return model
 
     return model_provider
-
-
-def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **extra_kwargs):
-        sig = inspect.signature(original_provider)
-        provider_kwargs = {
-            "pre_process": pre_process,
-            "post_process": post_process,
-        }
-        if "vp_stage" in sig.parameters:
-            provider_kwargs["vp_stage"] = vp_stage
-
-        # Newer Megatron-LM may pass extra provider kwargs such as config.
-        # Forward only the kwargs the wrapped provider actually declares.
-        for name, value in extra_kwargs.items():
-            if name in sig.parameters:
-                provider_kwargs[name] = value
-
-        model = original_provider(**provider_kwargs)
-
-        freeze_model_params(model, args)
-
-        return model
-
-    return wrapped_provider
-
-
-def freeze_model_params(model: GPTModel, args: argparse.Namespace):
-    if args.only_train_params_name_list:
-        for name, param in model.named_parameters():
-            param.requires_grad = False
-            for pattern in args.only_train_params_name_list:
-                if re.search(pattern, name):
-                    param.requires_grad = True
-                    break
-
-    if args.freeze_params_name_list:
-        for name, param in model.named_parameters():
-            for pattern in args.freeze_params_name_list:
-                if re.search(pattern, name):
-                    param.requires_grad = False
-                    break

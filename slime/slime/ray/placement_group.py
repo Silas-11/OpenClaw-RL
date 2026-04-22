@@ -4,6 +4,7 @@ import socket
 import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from slime.utils.common import is_npu
 
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
@@ -11,10 +12,13 @@ from .rollout import RolloutManager
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class InfoActor:
     def get_ip_and_gpu_id(self):
-        return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
+        if is_npu():
+            return ray.util.get_node_ip_address(), ray.get_runtime_context().get_accelerator_ids()["NPU"][0]
+        else:
+            return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
 
 
 def sort_key(x):
@@ -35,12 +39,13 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
-    return (node_ip_parts, gpu_id)
+    return (node_ip_parts, int(gpu_id))
 
 
 def _create_placement_group(num_gpus):
     """Create a placement group with the specified number of GPUs."""
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    device_name = "NPU" if is_npu() else "GPU"
+    bundles = [{device_name: 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -53,7 +58,8 @@ def _create_placement_group(num_gpus):
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=i,
-                )
+                ),
+                resources={device_name: 1}
             ).remote()
         )
     gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
@@ -80,10 +86,6 @@ def create_placement_groups(args):
     """Create placement groups for actor and rollout engines."""
 
     num_gpus = 0
-    prm_offset = None
-    prm_teacher_offset = None
-    use_prm_teacher = getattr(args, "prm_teacher_load", None) is not None and getattr(args, "prm_teacher_num_gpus", 0) > 0
-
     if args.debug_train_only:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
@@ -106,26 +108,12 @@ def create_placement_groups(args):
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
             rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
-        if args.prm_enable and args.prm_num_gpus > 0:
-            prm_offset = rollout_offset + args.rollout_num_gpus
-            num_gpus += args.prm_num_gpus
-        if use_prm_teacher:
-            prm_teacher_offset = num_gpus
-            num_gpus += args.prm_teacher_num_gpus
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
-    if prm_offset is not None:
-        prm_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[prm_offset : prm_offset + args.prm_num_gpus]
-        prm_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[prm_offset : prm_offset + args.prm_num_gpus]
-        rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:prm_offset]
-        rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:prm_offset]
-    if prm_teacher_offset is not None:
-        prm_teacher_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[prm_teacher_offset : prm_teacher_offset + args.prm_teacher_num_gpus]
-        prm_teacher_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[prm_teacher_offset : prm_teacher_offset + args.prm_teacher_num_gpus]
     if args.use_critic:
         critic_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic_offset:]
         critic_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[critic_offset:]
@@ -134,8 +122,6 @@ def create_placement_groups(args):
         "actor": (pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
         "critic": (pg, critic_pg_reordered_bundle_indices, critic_pg_reordered_gpu_ids) if args.use_critic else None,
         "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
-        "prm": (pg, prm_pg_reordered_bundle_indices, prm_pg_reordered_gpu_ids) if prm_offset is not None else None,
-        "prm_teacher": (pg, prm_teacher_pg_reordered_bundle_indices, prm_teacher_pg_reordered_gpu_ids) if prm_teacher_offset is not None else None,
     }
 
 
@@ -167,17 +153,6 @@ def create_training_models(args, pgs, rollout_manager):
     else:
         critic_model = None
 
-    prm_teacher_model = None
-    prm_teacher_init_handle = None
-    if pgs.get("prm_teacher") is not None:
-        prm_teacher_model = allocate_train_group(
-            args=args,
-            num_nodes=1,
-            num_gpus_per_node=getattr(args, "prm_teacher_num_gpus", 1),
-            pg=pgs["prm_teacher"],
-        )
-        prm_teacher_init_handle = prm_teacher_model.async_init(args, role="prm_teacher", with_ref=False)
-
     start_rollout_ids = ray.get(
         actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
     )
@@ -190,21 +165,20 @@ def create_training_models(args, pgs, rollout_manager):
         ray.get(critic_init_handle)
         actor_model.connect(critic_model)
 
-    if prm_teacher_init_handle is not None:
-        ray.get(prm_teacher_init_handle)
-
     actor_model.set_rollout_manager(rollout_manager)
     if args.rollout_global_dataset:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
-    return actor_model, critic_model, prm_teacher_model
+    return actor_model, critic_model
 
 
-def create_rollout_manager(args, pg, prm_pg=None):
+def create_rollout_manager(args, pg):
+    device_name = "NPU" if is_npu() else "GPU"
     rollout_manager = RolloutManager.options(
         num_cpus=1,
         num_gpus=0,
-    ).remote(args, pg, prm_pg)
+        resources={device_name: 0}
+    ).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

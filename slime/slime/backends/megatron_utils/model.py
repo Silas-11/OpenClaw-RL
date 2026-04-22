@@ -28,7 +28,7 @@ from slime.utils.memory_utils import clear_memory
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .model_provider import get_model_provider_func
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +105,7 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(
-        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
-    )
+    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
     kwargs = {}
@@ -230,7 +228,6 @@ def forward_only(
             labels=None,
             packed_seq_params=packed_seq_params,
             loss_mask=batch["full_loss_masks"],
-            fp32_output=False,
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
         )
 
@@ -260,6 +257,7 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
+        # collect_non_loss_data
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -268,6 +266,7 @@ def forward_only(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
+            collect_non_loss_data=True,
         )
 
     # Move model back to the train mode.
@@ -371,14 +370,6 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "max_seq_lens",
-                "teacher_log_probs",
-                "prm_teacher_log_probs",
-                "teacher_topk_log_probs",
-                "teacher_topk_indices",
-                "prm_teacher_topk_log_probs",
-                "prm_teacher_topk_indices",
-                "topk_log_probs",
-                "topk_indices",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -406,14 +397,6 @@ def train_one_step(
                 "labels": None,
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
-                # Match the forward-only path: do NOT have Megatron's
-                # Float16Module upcast the [1, T, V] logits to fp32. Slime's
-                # loss/log-prob code (get_responses + get_log_probs_and_entropy)
-                # accepts bf16/fp16 logits and upcasts only the per-sample
-                # response slices internally. Without this, packing 2 samples
-                # into a 16K microbatch produces a 7.58 GiB fp32 logits
-                # allocation that OOMs an 80GB GPU.
-                "fp32_output": False,
             }
 
             if args.enable_mtp_training:
@@ -500,6 +483,16 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def finalize_model_grads_with_empty_cache(*args, **kwargs):
+    # trigger empty cache when there are less than 10% free memory before the final reduce scatter.
+    # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
+    device = torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(device)
+    if free / total < 0.1:
+        clear_memory()
+    return finalize_model_grads(*args, **kwargs)
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -550,7 +543,7 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
 
     pre_hook_enabled = False
 
@@ -566,11 +559,6 @@ def train(
                 if "step" in group:
                     group["step"] = 0
             for state in chained_optimizer.optimizer.state.values():
-                if "step" in state:
-                    if isinstance(state["step"], torch.Tensor):
-                        state["step"].zero_()
-                    else:
-                        state["step"] = 0
                 if "exp_avg" in state:
                     state["exp_avg"].zero_()
                 if "exp_avg_sq" in state:

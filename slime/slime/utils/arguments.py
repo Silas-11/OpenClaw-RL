@@ -174,45 +174,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
-            parser.add_argument(
-                "--only-train-params-name-list",
-                type=str,
-                nargs="*",
-                default=None,
-                help="""List of regex patterns of parameter names to TRAIN. All other parameters will be FROZEN. 
-                        Supports Python regex syntax (re.search).
-
-                        Examples:
-                        1. Train ONLY MoE experts:
-                            --only-train-params-name-list experts
-
-                        2. Train ONLY Indexer parameters:
-                            --only-train-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
-
-                        3. Train ONLY Layer 20 to 23:
-                            --only-train-params-name-list layers\.2[0-3]\.
-                        """,
-            )
-
-            parser.add_argument(
-                "--freeze-params-name-list",
-                type=str,
-                nargs="*",
-                default=None,
-                help="""List of regex patterns of parameter names to FREEZE. Other parameters will remain trainable.
-                        Supports Python regex syntax (re.search).
-
-                        Examples:
-                        1. Freeze Embeddings and Output Layer (common for fine-tuning):
-                            --freeze-params-name-list embedding output_layer
-
-                        2. Freeze Indexer parameters:
-                            --freeze-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
-
-                        3. Freeze specific projection layers (e.g., all Gate/Up projections):
-                            --freeze-params-name-list linear_fc1
-                        """,
-            )
 
             return parser
 
@@ -338,36 +299,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The seed for the random number generator during rollout. "
                     "This is used to shuffle the prompts and also for the random sampling of the prompts."
                 ),
-            )
-            parser.add_argument(
-                "--gui-max-steps",
-                type=int,
-                default=None,
-                help="Maximum GUI interaction steps per rollout task.",
-            )
-            parser.add_argument(
-                "--gui-sleep-after-execution",
-                type=float,
-                default=None,
-                help="Sleep seconds after each GUI action during rollout.",
-            )
-            parser.add_argument(
-                "--gui-max-image-history-length",
-                type=int,
-                default=None,
-                help="Maximum number of image history entries used by GUI parser.",
-            )
-            parser.add_argument(
-                "--gui-max-reward-image-history-length",
-                type=int,
-                default=None,
-                help="Maximum number of reward image history entries used by GUI parser.",
-            )
-            parser.add_argument(
-                "--gui-wait-after-reset",
-                type=float,
-                default=None,
-                help="Seconds to wait after env reset before first observation (rollout).",
             )
 
             # sampling
@@ -744,10 +675,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
-            parser.add_argument("--gui-eval-max-steps", type=int, default=None)
-            parser.add_argument("--gui-eval-sleep-after-execution", type=float, default=None)
-            parser.add_argument("--gui-eval-wait-after-reset", type=float, default=None,
-                                help="Seconds to wait after env reset before first observation (eval).")
 
             return parser
 
@@ -763,65 +690,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
-            )
-            parser.add_argument(
-                "--prm-teacher-load",
-                type=str,
-                default=None,
-                help=(
-                    "HF checkpoint for the PRM teacher model (OPD distillation). "
-                    "Loaded on a dedicated GPU group with TP=1 via bridge mode. "
-                    "Log-probs go through the same Megatron code path as the student. "
-                    "Independent of --ref-load."
-                ),
-            )
-            parser.add_argument(
-                "--prm-teacher-num-gpus",
-                type=int,
-                default=1,
-                help="Number of GPUs for the PRM teacher model (default 1, TP=1).",
-            )
-            parser.add_argument(
-                "--prm-teacher-rotary-base",
-                type=float,
-                default=None,
-                help=(
-                    "Override --rotary-base for the PRM teacher only. Use when the teacher and "
-                    "the actor have different rope_theta (e.g. stock Qwen3-4B rope_theta=1e6 "
-                    "vs a long-context SFT fine-tune with rope_theta=5e6). "
-                    "Defaults to --rotary-base when unset."
-                ),
-            )
-            parser.add_argument(
-                "--prm-teacher-megatron-to-hf-mode",
-                choices=["raw", "bridge"],
-                default=None,
-                help=(
-                    "Override --megatron-to-hf-mode for the PRM teacher only. When unset, the "
-                    "teacher inherits the global --megatron-to-hf-mode. Setting this to a "
-                    "different value than the student is the supported way to mix modes "
-                    "(e.g. raw student + bridge teacher, or raw student of one size + raw "
-                    "teacher of a different size). In 'raw' mode the teacher's architectural "
-                    "fields (num_layers / hidden_size / ffn_hidden_size / num_query_groups / "
-                    "kv_channels / vocab / RoPE / etc.) are auto-populated from the teacher's "
-                    "torch_dist common.pt, so the teacher can be a different model size than "
-                    "the student's MODEL_ARGS (e.g. Qwen3-8B teacher with Qwen3-4B student). "
-                    "In 'bridge' mode the architecture is built from the teacher's HF config; "
-                    "use --prm-teacher-hf-checkpoint to point at the teacher's HF directory "
-                    "when --prm-teacher-load is a torch_dist directory."
-                ),
-            )
-            parser.add_argument(
-                "--prm-teacher-hf-checkpoint",
-                type=str,
-                default=None,
-                help=(
-                    "Override --hf-checkpoint for the PRM teacher only. Used for the teacher's "
-                    "tokenizer and HF-config lookup, and as the bridge source when "
-                    "--prm-teacher-megatron-to-hf-mode=bridge. Required for bridge teacher "
-                    "when --prm-teacher-load is a torch_dist (non-HF) directory. Defaults to "
-                    "the actor's --hf-checkpoint when unset."
-                ),
             )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
@@ -909,7 +777,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 choices=[
                     "grpo",
                     "gspo",
-                    "step_wise",
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
@@ -925,26 +792,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to disable computing advantages and returns. "
                     "If set, we will not compute the advantages and returns, "
                     "This is useful for sft or custom loss function."
-                ),
-            )
-            parser.add_argument(
-                "--distill-topk",
-                type=int,
-                default=0,
-                help="Number of top-K teacher logprobs for logits-based distillation loss. "
-                "Set to >0 (e.g. 50) to enable top-K distillation via custom_loss.",
-            )
-            parser.add_argument(
-                "--distill-subset-mode",
-                type=str,
-                choices=["student", "teacher", "overlap"],
-                default="student",
-                help=(
-                    "How the per-token subset Sₜ is selected for top-K OPD: "
-                    "'student' (default) = student top-K (extra teacher gather pass), "
-                    "'teacher' = teacher top-K (extra student-old gather pass), "
-                    "'overlap' = student top-K ∩ teacher top-K (no extra pass). "
-                    "Only consumed when --distill-topk > 0."
                 ),
             )
             parser.add_argument(
@@ -1289,17 +1136,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_reward_model_arguments(parser):
             parser.add_argument(
-                "--dynamic-history",
-                "--dynamic_history",
-                dest="dynamic_history",
-                action="store_true",
-                default=False,
-                help=(
-                    "Enable dynamic-history training data mode for tool-use rollouts. "
-                    "When enabled, each action step is exported as an independent training sample."
-                ),
-            )
-            parser.add_argument(
                 "--rm-type",
                 type=str,
                 default=None,
@@ -1356,66 +1192,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If set, this function will replace the default _convert_samples_to_train_data. "
                     "The function should have the signature `def convert_samples_to_train_data(args, samples) -> dict`."
                 ),
-            )
-            parser.add_argument(
-                "--prm-enable",
-                action="store_true",
-                default=False,
-                help="Enable framework-hosted PRM servers and step-wise PRM scoring.",
-            )
-            parser.add_argument(
-                "--prm-num-gpus",
-                type=int,
-                default=0,
-                help="Total number of GPUs allocated for PRM inference servers.",
-            )
-            parser.add_argument(
-                "--prm-num-gpus-per-engine",
-                type=int,
-                default=1,
-                help="Number of GPUs per PRM engine (like TP size for PRM).",
-            )
-            parser.add_argument(
-                "--prm-m",
-                type=int,
-                default=4,
-                help="Number of independent PRM calls per step; the step score is the mean.",
-            )
-            parser.add_argument(
-                "--prm-router-ip",
-                type=str,
-                default=None,
-                help="IP address of the PRM router. Auto-assigned when not set.",
-            )
-            parser.add_argument(
-                "--prm-router-port",
-                type=int,
-                default=None,
-                help="Port of the PRM router. Auto-assigned when not set.",
-            )
-            parser.add_argument(
-                "--prm-model-path",
-                type=str,
-                default=None,
-                help="PRM model path for PRM engines; defaults to --hf-checkpoint when unset.",
-            )
-            parser.add_argument(
-                "--prm-step-coef",
-                type=float,
-                default=1.0,
-                help="Coefficient for PRM step-wise score when composing the final reward.",
-            )
-            parser.add_argument(
-                "--prm-temperature",
-                type=float,
-                default=1.0,
-                help="Sampling temperature for PRM judge generation.",
-            )
-            parser.add_argument(
-                "--prm-max-new-tokens",
-                type=int,
-                default=2048,
-                help="Max new tokens for each PRM judge generation call.",
             )
             return parser
 
@@ -1571,14 +1347,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_sglang_tp_size():
             temp_parser = argparse.ArgumentParser(add_help=False)
             temp_parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=1)
-            temp_parser.add_argument("--sglang-pp-size", type=int, default=1)
-            temp_parser.add_argument("--sglang-pipeline-parallel-size", type=int, default=1)
             temp_args, _ = temp_parser.parse_known_args()
-            # Use sglang_pp_size if set (non-default), otherwise use sglang_pipeline_parallel_size
-            pp_size = (
-                temp_args.sglang_pp_size if temp_args.sglang_pp_size != 1 else temp_args.sglang_pipeline_parallel_size
-            )
-            sglang_tp_size = temp_args.rollout_num_gpus_per_engine // pp_size
+            sglang_tp_size = temp_args.rollout_num_gpus_per_engine
             return sglang_tp_size
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
@@ -1632,7 +1402,7 @@ def parse_args(add_custom_arguments=None):
         from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
         args = megatron_parse_args(extra_args_provider=add_slime_arguments)
-        if args.hf_checkpoint and not args.debug_rollout_only:
+        if args.hf_checkpoint:
             hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
             hf_validate_args(args, hf_config)
 
@@ -1760,7 +1530,7 @@ def slime_validate_args(args):
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
 
-    if args.eval_interval is not None and args.eval_function_path is None:
+    if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
 
     if args.save_interval is not None:
@@ -1797,17 +1567,6 @@ def slime_validate_args(args):
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
-
-    if not args.prm_enable:
-        args.prm_num_gpus = 0
-    else:
-        assert args.prm_num_gpus > 0, "When --prm-enable is set, --prm-num-gpus must be > 0."
-        assert args.prm_num_gpus_per_engine > 0, "--prm-num-gpus-per-engine must be > 0."
-        assert args.prm_num_gpus % min(args.prm_num_gpus_per_engine, args.num_gpus_per_node) == 0, (
-            "prm_num_gpus must be divisible by min(prm_num_gpus_per_engine, num_gpus_per_node)."
-        )
-        if args.prm_model_path is None:
-            args.prm_model_path = args.hf_checkpoint
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
@@ -1950,27 +1709,10 @@ def slime_validate_args(args):
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
 
-    if args.only_train_params_name_list and args.freeze_params_name_list:
-        raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
-
-    if getattr(args, "use_lora", False):
-        assert args.train_backend == "fsdp", "LoRA is only supported with --train-backend fsdp"
-
 
 def hf_validate_args(args, hf_config):
     def equal(x, y):
         return x == y
-
-    def get_arg_value(name):
-        # Newer Megatron-Core renamed some argparse destinations while keeping
-        # the same CLI flags. Accept both spellings here.
-        alias_map = {
-            "norm_epsilon": ("norm_epsilon", "layernorm_epsilon"),
-        }
-        for candidate in alias_map.get(name, (name,)):
-            if hasattr(args, candidate):
-                return getattr(args, candidate)
-        raise AttributeError(f"'Namespace' object has no attribute '{name}'")
 
     errors = []
 
@@ -1987,23 +1729,11 @@ def hf_validate_args(args, hf_config):
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rope_theta", "rotary_base", equal),
     ]:
-        # Handle nested rope_parameters for models like Qwen3.5
-        hf_value = None
-        if hf_config_name == "rope_theta" and hasattr(hf_config, "rope_parameters"):
-            rope_params = getattr(hf_config, "rope_parameters")
-            if isinstance(rope_params, dict) and "rope_theta" in rope_params:
-                hf_value = rope_params["rope_theta"]
-            elif hasattr(rope_params, "rope_theta"):
-                hf_value = getattr(rope_params, "rope_theta")
-        elif hasattr(hf_config, hf_config_name):
-            hf_value = getattr(hf_config, hf_config_name)
-
-        if hf_value is not None:
-            arg_value = get_arg_value(megatron_config_name)
-            if not compare_fn(hf_value, arg_value):
+        if hasattr(hf_config, hf_config_name):
+            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
-                    f"{hf_config_name} in hf config {hf_value} is not equal to "
-                    f"{megatron_config_name} {arg_value}, please check the config."
+                    f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
+                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
                 )
 
     if len(errors) > 0:

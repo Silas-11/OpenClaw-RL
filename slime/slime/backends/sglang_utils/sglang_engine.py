@@ -13,9 +13,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
-from .qwen3_5 import is_qwen35_model_path, maybe_prepare_qwen35_text_model, patch_sglang_qwen35
 from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
+from slime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,10 @@ def get_base_gpu_id(args, rank):
 
 
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if is_npu():
+        cvd = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    else:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if not cvd:
         return physical_gpu_id  # no remapping
     # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
@@ -52,9 +55,11 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    from sglang.srt.entrypoints.http_server import launch_server
+
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=_launch_server_entry, args=(server_args,))
+    p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
@@ -67,16 +72,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     )
 
     return p
-
-
-def _launch_server_entry(server_args: ServerArgs):
-    try:
-        patch_sglang_qwen35()
-    except (ImportError, ModuleNotFoundError):
-        pass
-    from sglang.srt.entrypoints.http_server import launch_server
-
-    launch_server(server_args)
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive):
@@ -116,27 +111,15 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
 
 
 class SGLangEngine(RayActor):
-    def __init__(
-        self,
-        args,
-        rank: int,
-        worker_type: str = "regular",
-        base_gpu_id: int | None = None,
-        engine_role: str = "rollout",
-    ):
+    def __init__(self, args, rank: int, worker_type: str = "regular", base_gpu_id: int | None = None):
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
-        self.engine_role = engine_role
 
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
-        if self.engine_role == "prm":
-            self.router_ip = self.args.prm_router_ip
-            self.router_port = self.args.prm_router_port
-        else:
-            self.router_ip = self.args.sglang_router_ip
-            self.router_port = self.args.sglang_router_port
+        self.router_ip = self.args.sglang_router_ip
+        self.router_port = self.args.sglang_router_port
 
         host = host or get_host_info()[1]
 
@@ -164,7 +147,6 @@ class SGLangEngine(RayActor):
             self.worker_type,
             disaggregation_bootstrap_port,
             base_gpu_id=self.base_gpu_id,
-            engine_role=self.engine_role,
         )
 
         self.node_rank = server_args_dict["node_rank"]
@@ -498,37 +480,17 @@ def _compute_server_args(
     worker_type: str = "regular",
     disaggregation_bootstrap_port: int | None = None,
     base_gpu_id: int | None = None,
-    engine_role: str = "rollout",
 ):
-    is_prm = engine_role == "prm"
-    gpus_per_engine = args.prm_num_gpus_per_engine if is_prm else args.rollout_num_gpus_per_engine
-    original_model_path = args.prm_model_path if is_prm else (getattr(args, "rollout_model_path", None) or args.hf_checkpoint)
-    model_path = original_model_path
-    model_path = maybe_prepare_qwen35_text_model(
-        model_path,
-        language_only=getattr(args, "sglang_language_only", False),
-    )
-    server_language_only = getattr(args, "sglang_language_only", False)
-    # Once Qwen3.5 has been materialized as a text-only shadow checkpoint, we should
-    # stop forwarding `language_only` to SGLang. Recent SGLang builds interpret the
-    # flag as encoder disaggregation and require `--encoder-urls`, even though the
-    # shadow checkpoint is already a plain text model.
-    if model_path != original_model_path and is_qwen35_model_path(model_path):
-        server_language_only = False
-    if is_qwen35_model_path(model_path) or is_qwen35_model_path(original_model_path):
-        os.environ["SLIME_ENABLE_QWEN35_SGLANG_PATCH"] = "1"
-        os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "slime_plugins.sglang_models"
-
-    nnodes = max(1, gpus_per_engine // args.num_gpus_per_node)
+    nnodes = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
-        "model_path": model_path,
+        "model_path": args.hf_checkpoint,
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory
-        "enable_memory_saver": args.offload_rollout if not is_prm else False,
+        "enable_memory_saver": args.offload_rollout,
         # distributed
         "host": host,
         "port": port,
@@ -539,7 +501,7 @@ def _compute_server_args(
         "gpu_id_step": 1,
         "base_gpu_id": base,
         # parallel
-        "tp_size": gpus_per_engine // args.sglang_pp_size,
+        "tp_size": args.rollout_num_gpus_per_engine,
         "dp_size": args.sglang_dp_size,
         "pp_size": args.sglang_pp_size,
         "ep_size": args.sglang_ep_size,
@@ -549,14 +511,14 @@ def _compute_server_args(
         "enable_draft_weights_cpu_backup": True,
     }
 
-    if worker_type == "prefill" and not is_prm:
+    if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
         kwargs["load_balance_method"] = "round_robin"
         assert (
             disaggregation_bootstrap_port is not None
         ), "disaggregation_bootstrap_port must be set for prefill worker"
         kwargs["disaggregation_bootstrap_port"] = disaggregation_bootstrap_port
-    elif worker_type == "decode" and not is_prm:
+    elif worker_type == "decode":
         kwargs["disaggregation_mode"] = "decode"
         kwargs["prefill_round_robin_balance"] = True
 
@@ -569,10 +531,6 @@ def _compute_server_args(
     unused_keys = set(kwargs.keys())
     for attr in dataclasses.fields(ServerArgs):
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-            continue
-        if attr.name == "language_only":
-            kwargs[attr.name] = server_language_only
-            unused_keys.discard(attr.name)
             continue
         if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
             kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")

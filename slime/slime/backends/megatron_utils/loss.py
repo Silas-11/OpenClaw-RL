@@ -1,46 +1,13 @@
-import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
-
-logger = logging.getLogger(__name__)
-
-# Module-level toggle. When True, get_log_probs_and_entropy additionally
-# returns "topk_log_probs" / "topk_indices" (used by the prm_teacher actor
-# path for distillation). Defaults to False so that the regular old_actor
-# / ref / actor compute_log_prob passes are unchanged.
-_EMIT_TOPK_LOGPROBS: bool = False
-
-
-class emit_topk_logprobs:
-    """Context manager: opt the wrapped compute_log_prob call into emitting
-    per-token top-K log-probabilities and global vocab indices.
-
-    Only the prm_teacher actor uses this; the regular actor/old_actor/ref
-    forwards do NOT enter this context, so their output dicts are byte-
-    identical to before.
-    """
-
-    def __enter__(self):
-        global _EMIT_TOPK_LOGPROBS
-        self._prev = _EMIT_TOPK_LOGPROBS
-        _EMIT_TOPK_LOGPROBS = True
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        global _EMIT_TOPK_LOGPROBS
-        _EMIT_TOPK_LOGPROBS = self._prev
-        return False
-
-
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
@@ -54,12 +21,7 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.types import RolloutBatch
 
-from .cp_utils import (
-    all_gather_with_cp,
-    get_logits_and_tokens_offset_with_cp,
-    get_sum_of_sample_mean,
-    slice_log_prob_with_cp,
-)
+from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
 
 def get_responses(
@@ -75,46 +37,27 @@ def get_responses(
 
     After squeezing batch dimension and applying temperature scaling, this
     function extracts the logits and tokens corresponding to response segments
-    for each sample.  When context parallelism is disabled, it slices directly
-    from the concatenated sequence.  With context parallelism enabled, it
+    for each sample. When context parallelism is disabled, it slices directly
+    from the concatenated sequence. With context parallelism enabled, it
     handles split sequences across ranks.
 
-    Logits may arrive in any floating-point dtype (fp32, bf16, fp16).  The
-    yielded chunks preserve the original dtype — no fp32 up-cast is performed
-    here, so GPU memory stays bounded by the micro-batch logits tensor.
-    Downstream consumers (``fused_vocab_parallel_cross_entropy``, etc.) handle
-    mixed-precision arithmetic internally.
-
     Args:
-        logits: Model outputs with shape ``[1, T, V]`` (policy) or
-            ``[1, T, 1]`` (value).
-        args: Configuration containing ``rollout_temperature`` for scaling.
+        logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
+            (value). Must be float32.
+        args: Configuration containing `rollout_temperature` for scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
         response_lengths: Response segment lengths per sample.
 
     Yields:
-        Tuple of ``(logits_chunk, tokens_chunk)`` where ``logits_chunk`` is
-        shape ``[R, V]`` (policy) or ``[R, 1]`` (value) and ``tokens_chunk``
-        is shape ``[R]`` (1-D int64), both aligned to response tokens for one
-        sample.
+        Tuple of `(logits_chunk, tokens_chunk)` where `logits_chunk` is shape
+        `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
+        (1D int64), both aligned to response tokens for one sample.
     """
     qkv_format = args.qkv_format
 
+    assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
-
-    logits_gib = logits.nelement() * logits.element_size() / (1 << 30)
-    if logits_gib > 2.0:
-        logger.warning(
-            "get_responses: large logits tensor %s dtype=%s (%.2f GiB), "
-            "num_samples=%d, sum(total_lengths)=%d, sum(response_lengths)=%d",
-            list(logits.shape),
-            logits.dtype,
-            logits_gib,
-            len(unconcat_tokens),
-            sum(total_lengths),
-            sum(response_lengths),
-        )
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -123,7 +66,8 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    apply_temp = args.rollout_temperature != 1.0
+    if args.rollout_temperature != 1.0:
+        logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -162,8 +106,6 @@ def get_responses(
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
 
-        if apply_temp:
-            logits_chunk = logits_chunk / args.rollout_temperature
         yield logits_chunk, tokens_chunk
 
 
@@ -201,16 +143,8 @@ def get_log_probs_and_entropy(
         a list of `[R]` tensors.
     """
     assert non_loss_data
-    tp_group = mpu.get_tensor_model_parallel_group()
-    # Top-K is opt-in via emit_topk_logprobs() context manager. By default
-    # the regular old_actor / ref / actor compute_log_prob passes do NOT
-    # emit top-K data, so their outputs are unchanged. Only the prm_teacher
-    # path opts in (see actor.compute_prm_teacher_log_probs).
-    distill_topk = int(getattr(args, "distill_topk", 0) or 0) if _EMIT_TOPK_LOGPROBS else 0
     log_probs_list = []
     entropy_list = []
-    topk_log_probs_list = []
-    topk_indices_list = []
     for logits_chunk, tokens_chunk in get_responses(
         logits,
         args=args,
@@ -222,7 +156,7 @@ def get_log_probs_and_entropy(
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk,
             tokens_chunk,
-            tp_group,
+            mpu.get_tensor_model_parallel_group(),
             with_entropy=with_entropy,
             chunk_size=args.log_probs_chunk_size,
         )
@@ -230,219 +164,12 @@ def get_log_probs_and_entropy(
         log_probs_list.append(log_prob.squeeze(-1))
         entropy_list.append(entropy)
 
-        if distill_topk > 0:
-            topk_lp, topk_idx = _vocab_parallel_topk_log_probs(logits_chunk, distill_topk, tp_group)
-            topk_log_probs_list.append(topk_lp)
-            topk_indices_list.append(topk_idx)
-
     res = {
         "log_probs": log_probs_list,
     }
     if with_entropy:
         res["entropy"] = entropy_list
-    if distill_topk > 0:
-        res["topk_log_probs"] = topk_log_probs_list
-        res["topk_indices"] = topk_indices_list
-    return torch.empty((0,), device=logits.device), res
-
-
-def _vocab_parallel_topk_log_probs(
-    logits: torch.Tensor,
-    K: int,
-    tp_group,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Global top-K log-probs and (global vocab) indices from TP-sharded logits.
-
-    Args:
-        logits: ``[seq, vocab_local]`` (vocab_local = vocab // tp_world).
-        K: global top-K to keep.
-        tp_group: TP process group.
-
-    Returns:
-        ``(topk_log_probs [seq, K], topk_indices [seq, K])`` with indices in
-        the GLOBAL vocab space, so any TP rank can re-gather log-probs at
-        them with ``compute_log_probs``.
-    """
-    if K <= 0 or logits.numel() == 0:
-        return (
-            logits.new_zeros((logits.size(0), 0)),
-            torch.zeros((logits.size(0), 0), dtype=torch.long, device=logits.device),
-        )
-
-    tp_world = dist.get_world_size(group=tp_group) if dist.is_initialized() else 1
-    tp_rank = dist.get_rank(group=tp_group) if dist.is_initialized() else 0
-    vocab_local = logits.size(-1)
-
-    # Global log-softmax across TP-sharded vocab (kept in fp32 for safety;
-    # logits may arrive as bf16/fp16).
-    work = logits.float()
-    local_max = work.max(dim=-1, keepdim=True).values
-    if tp_world > 1:
-        dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
-    shifted = work - local_max
-    sum_exp = shifted.exp().sum(dim=-1, keepdim=True)
-    if tp_world > 1:
-        dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
-    log_probs_local = shifted - sum_exp.log()
-
-    K_local = min(K, vocab_local)
-    local_lp, local_idx_local = log_probs_local.topk(K_local, dim=-1)
-    local_idx_global = local_idx_local + tp_rank * vocab_local
-
-    if tp_world == 1:
-        return local_lp, local_idx_global
-
-    # Gather every shard's local top-K, then global top-K from K_local*tp_world
-    # candidates. Exact: any global top-K token is in some shard's top-K_local.
-    gathered_lp = [torch.zeros_like(local_lp) for _ in range(tp_world)]
-    gathered_idx = [torch.zeros_like(local_idx_global) for _ in range(tp_world)]
-    dist.all_gather(gathered_lp, local_lp, group=tp_group)
-    dist.all_gather(gathered_idx, local_idx_global, group=tp_group)
-    cat_lp = torch.cat(gathered_lp, dim=-1)
-    cat_idx = torch.cat(gathered_idx, dim=-1)
-    K_eff = min(K, cat_lp.size(-1))
-    final_lp, sort_pos = cat_lp.topk(K_eff, dim=-1)
-    final_idx = torch.gather(cat_idx, -1, sort_pos)
-    return final_lp, final_idx
-
-
-# Per-call indices payload for the gather-at-indices forward path. A list
-# of [R_i, K] long tensors (one per sample), GLOBAL vocab ids. Set just
-# before calling forward_only(gather_log_probs_at_indices, ...) and read
-# inside that function. Module-level (not threadlocal) because Megatron's
-# pipeline runner is single-threaded per actor process.
-_GATHER_AT_INDICES_PAYLOAD: list[torch.Tensor] | None = None
-_GATHER_AT_INDICES_CURSOR: int = 0
-
-
-class set_gather_at_indices:
-    """Context manager: provide a list[Tensor] of GLOBAL vocab ids per sample.
-
-    The next ``len(payload)`` calls to ``gather_log_probs_at_indices`` (one
-    per response chunk in pipeline order) consume one tensor each. Used to
-    drive the extra "gather at S_t" forwards needed by ``--distill-subset-
-    mode={student,teacher}`` distillation.
-    """
-
-    def __init__(self, payload: list[torch.Tensor]):
-        self._payload = payload
-
-    def __enter__(self):
-        global _GATHER_AT_INDICES_PAYLOAD, _GATHER_AT_INDICES_CURSOR
-        self._prev_payload = _GATHER_AT_INDICES_PAYLOAD
-        self._prev_cursor = _GATHER_AT_INDICES_CURSOR
-        _GATHER_AT_INDICES_PAYLOAD = self._payload
-        _GATHER_AT_INDICES_CURSOR = 0
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        global _GATHER_AT_INDICES_PAYLOAD, _GATHER_AT_INDICES_CURSOR
-        _GATHER_AT_INDICES_PAYLOAD = self._prev_payload
-        _GATHER_AT_INDICES_CURSOR = self._prev_cursor
-        return False
-
-
-def _vocab_parallel_log_probs_at_indices(
-    logits: torch.Tensor,
-    indices: torch.Tensor,
-    tp_group,
-) -> torch.Tensor:
-    """No-grad: GLOBAL log-probs at given GLOBAL vocab indices, TP-sharded.
-
-    Args:
-        logits:  ``[seq, V_local]``.
-        indices: ``[seq, K]`` global vocab ids in ``[0, V)``.
-
-    Returns:
-        ``[seq, K]`` fp32 ``log softmax(logits_global)[indices]``.
-    """
-    if logits.numel() == 0 or indices.numel() == 0:
-        return logits.new_zeros((logits.size(0), indices.size(-1) if indices.dim() > 1 else 0), dtype=torch.float32)
-
-    tp_world = dist.get_world_size(group=tp_group) if dist.is_initialized() else 1
-    tp_rank = dist.get_rank(group=tp_group) if dist.is_initialized() else 0
-    V_local = logits.size(-1)
-    shard_lo = tp_rank * V_local
-
-    work = logits.float()
-    local_max = work.max(dim=-1, keepdim=True).values
-    if tp_world > 1:
-        dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
-    shifted = work - local_max
-    sum_exp = shifted.exp().sum(dim=-1, keepdim=True)
-    if tp_world > 1:
-        dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
-    log_sum_exp = sum_exp.log()  # [seq, 1] fp32
-
-    in_shard = (indices >= shard_lo) & (indices < shard_lo + V_local)
-    idx_local = (indices - shard_lo).clamp(min=0, max=V_local - 1)
-    gathered = torch.gather(work, dim=-1, index=idx_local)  # [seq, K] fp32
-    gathered_masked = torch.where(in_shard, gathered, torch.zeros_like(gathered))
-    if tp_world > 1:
-        dist.all_reduce(gathered_masked, op=dist.ReduceOp.SUM, group=tp_group)
-    return gathered_masked - log_sum_exp
-
-
-def gather_log_probs_at_indices(
-    logits: torch.Tensor,
-    *,
-    args: Namespace,
-    unconcat_tokens: list[torch.Tensor],
-    total_lengths: list[int],
-    response_lengths: list[int],
-    with_entropy: bool = False,
-    non_loss_data: bool = True,
-    max_seq_lens: list[int] | None = None,
-) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
-    """No-grad: gather GLOBAL log-probs at indices supplied via ``set_gather_at_indices``.
-
-    Mirrors ``get_log_probs_and_entropy``'s signature so it slots into the
-    same ``forward_only`` codepath. Returns a dict with two keys:
-
-    * ``topk_log_probs``: list of ``[R_i, K]`` fp32 log-probs per sample.
-    * ``topk_indices``:   list of ``[R_i, K]`` long indices per sample
-      (echoed from the payload for downstream consumers).
-    """
-    assert non_loss_data
-    global _GATHER_AT_INDICES_PAYLOAD, _GATHER_AT_INDICES_CURSOR
-    payload = _GATHER_AT_INDICES_PAYLOAD
-    if payload is None:
-        raise RuntimeError(
-            "gather_log_probs_at_indices called outside set_gather_at_indices() context."
-        )
-    tp_group = mpu.get_tensor_model_parallel_group()
-    log_probs_list: list[torch.Tensor] = []
-    indices_list: list[torch.Tensor] = []
-    for logits_chunk, _tokens_chunk in get_responses(
-        logits,
-        args=args,
-        unconcat_tokens=unconcat_tokens,
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-        max_seq_lens=max_seq_lens,
-    ):
-        if _GATHER_AT_INDICES_CURSOR >= len(payload):
-            raise RuntimeError(
-                f"gather_log_probs_at_indices: payload exhausted at cursor "
-                f"{_GATHER_AT_INDICES_CURSOR} (payload len={len(payload)})."
-            )
-        idx_cpu = payload[_GATHER_AT_INDICES_CURSOR]
-        _GATHER_AT_INDICES_CURSOR += 1
-        idx = idx_cpu.to(device=logits_chunk.device, dtype=torch.long)
-        if idx.dim() == 1:
-            idx = idx.unsqueeze(-1)
-        if idx.size(0) != logits_chunk.size(0):
-            raise RuntimeError(
-                f"gather_log_probs_at_indices: chunk has {logits_chunk.size(0)} "
-                f"tokens but payload has {idx.size(0)} index rows."
-            )
-        lp = _vocab_parallel_log_probs_at_indices(logits_chunk, idx, tp_group)
-        log_probs_list.append(lp)
-        indices_list.append(idx)
-    return torch.empty((0,), device=logits.device), {
-        "topk_log_probs": log_probs_list,
-        "topk_indices": indices_list,
-    }
+    return res
 
 
 def get_values(
@@ -487,7 +214,7 @@ def get_values(
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
 
-    return torch.empty((0,), device=logits.device), {
+    return {
         "values": value_list,
     }
 
@@ -497,9 +224,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "step_wise", "ppo",
-    "reinforce_plus_plus", and "reinforce_plus_plus_baseline". When
-    `args.normalize_advantages` is
+    estimator. Supported methods: "grpo", "gspo", "ppo", "reinforce_plus_plus",
+    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
 
@@ -524,15 +250,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     max_seq_lens: list[int] | None = rollout_data.get("max_seq_lens", None)
 
     # return when not the last pp stage.
-    if not mpu.is_pipeline_last_stage():
+    if log_probs is None and values is None:
         return
-
-    # loss_masks live on CPU (lazy-loading optimisation).  We need GPU copies
-    # for the advantage / KL / normalisation math below.  The original CPU
-    # tensors in rollout_data["loss_masks"] are NOT modified.
-    if loss_masks and isinstance(loss_masks[0], torch.Tensor) and not loss_masks[0].is_cuda:
-        _gpu = torch.cuda.current_device()
-        loss_masks = [m.to(device=_gpu) for m in loss_masks]
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
@@ -549,80 +268,12 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         ]
 
     if args.advantage_estimator in ["grpo", "gspo"]:
-        # Reward normalization is handled in rollout.py for clarity.
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
         advantages = [r for r in returns]
 
-    elif args.advantage_estimator == "step_wise":
-        # Step-wise rewards are pre-normalized in rollout.py; here we only
-        # project each step scalar onto its token span.
-        step_rewards_per_sample = rollout_data.get("step_wise_step_rewards")
-        step_spans_per_sample = rollout_data.get("step_wise_step_token_spans")
-        step_indices_per_sample = rollout_data.get("step_wise_step_indices")
-
-        if step_rewards_per_sample is None or step_spans_per_sample is None or step_indices_per_sample is None:
-            raise ValueError(
-                "step_wise advantage requires rollout_data keys: "
-                "step_wise_step_rewards, step_wise_step_token_spans, step_wise_step_indices"
-            )
-
-        advantages = []
-        returns = []
-        num_samples = len(response_lengths)
-        for i in range(num_samples):
-            response_len = int(response_lengths[i])
-            total_len = int(total_lengths[i])
-            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
-
-            # Build full response-space advantage first, then slice with CP.
-            full_adv = torch.zeros(response_len, dtype=torch.float32, device=kl[0].device)
-            full_mask = loss_masks[i].to(device=full_adv.device, dtype=full_adv.dtype)
-
-            step_rewards_i = step_rewards_per_sample[i] or []
-            step_spans_i = step_spans_per_sample[i] or []
-            step_indices_i = (
-                (step_indices_per_sample[i] or [])
-                if step_indices_per_sample is not None
-                else list(range(min(len(step_rewards_i), len(step_spans_i))))
-            )
-            aligned_len = min(len(step_rewards_i), len(step_spans_i), len(step_indices_i))
-
-            for pos in range(aligned_len):
-                span = step_spans_i[pos]
-                if not isinstance(span, (list, tuple)) or len(span) != 2:
-                    continue
-                start, end = int(span[0]), int(span[1])
-                if not (0 <= start < end <= response_len):
-                    continue
-
-                # Broadcast the same step-level value to all tokens in this step span.
-                full_adv[start:end] = float(step_rewards_i[pos])
-
-            # Ensure non-trainable positions remain zero.
-            full_adv = full_adv * full_mask
-
-            # Convert full response-space vector to local CP chunk.
-            local_adv = slice_log_prob_with_cp(
-                full_adv,
-                total_len,
-                response_len,
-                args.qkv_format,
-                max_seq_len,
-            )
-            if isinstance(local_adv, list):
-                local_adv = torch.tensor(local_adv, dtype=full_adv.dtype, device=full_adv.device)
-
-            # GRPO-style training path expects returns; for this estimator we set
-            # returns == advantages.
-            advantages.append(local_adv)
-            returns.append(local_adv.clone())
-
     elif args.advantage_estimator == "ppo":
-        if values is None:
-            raise ValueError("ppo advantage estimator requires rollout_data['values'], but got None.")
-
         old_rewards = rewards
         rewards = []
         kl_coef = -args.kl_coef
@@ -679,7 +330,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
-    if args.normalize_advantages and args.advantage_estimator != "step_wise":
+    if args.normalize_advantages:
         all_advs = torch.cat(advantages)
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size == 1:
@@ -825,14 +476,13 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
 
-    need_entropy_for_loss = args.entropy_coef != 0.0
-    _, log_probs_and_entropy = get_log_probs_and_entropy(
+    log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=need_entropy_for_loss,
+        with_entropy=True,
         max_seq_lens=max_seq_lens,
     )
 
@@ -944,26 +594,10 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
-    # entropy loss:
-    # - when entropy contributes to the objective, compute with grad.
-    # - when entropy_coef == 0, compute under no_grad only for monitoring.
-    if need_entropy_for_loss:
-        entropy = log_probs_and_entropy["entropy"]
-        entropy = torch.cat(entropy, dim=0)
-        entropy_loss = sum_of_sample_mean(entropy)
-    else:
-        with torch.no_grad():
-            _, entropy_for_monitor = get_log_probs_and_entropy(
-                logits,
-                args=args,
-                unconcat_tokens=batch["unconcat_tokens"],
-                total_lengths=total_lengths,
-                response_lengths=response_lengths,
-                with_entropy=True,
-                max_seq_lens=max_seq_lens,
-            )
-            entropy = torch.cat(entropy_for_monitor["entropy"], dim=0)
-            entropy_loss = sum_of_sample_mean(entropy)
+    # entropy loss
+    entropy = log_probs_and_entropy["entropy"]
+    entropy = torch.cat(entropy, dim=0)
+    entropy_loss = sum_of_sample_mean(entropy)
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -1046,7 +680,7 @@ def value_loss_function(
     """
     old_values = torch.cat(batch["values"], dim=0)
 
-    _, values = get_values(
+    values = get_values(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
@@ -1104,7 +738,7 @@ def sft_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
-    _, log_probs_and_entropy = get_log_probs_and_entropy(
+    log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
@@ -1161,6 +795,7 @@ def loss_function(
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
+
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
         batch["response_lengths"],
@@ -1198,7 +833,7 @@ def loss_function(
 
     return (
         loss,
-        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        torch.tensor(num_tokens if args.calculate_per_token_loss else 1, device=logits.device),
         {
             "keys": list(log.keys()),
             "values": torch.tensor(

@@ -22,32 +22,8 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
-def _to_cuda(val: object) -> object:
-    """Recursively move tensors to current CUDA device.
-
-    Handles bare tensors, lists, dicts (including nested), and None.
-    Non-tensor scalars (int, float, str, etc.) pass through unchanged.
-    """
-    if val is None:
-        return None
-    if isinstance(val, torch.Tensor):
-        if val.is_cuda:
-            return val
-        return val.to(device=torch.cuda.current_device(), non_blocking=True)
-    if isinstance(val, list):
-        return [_to_cuda(v) for v in val]
-    if isinstance(val, tuple):
-        return tuple(_to_cuda(v) for v in val)
-    if isinstance(val, dict):
-        return {k: _to_cuda(v) for k, v in val.items()}
-    return val
-
-
 def get_batch(
-    data_iterator: "DataIterator",
-    keys: Sequence[str],
-    pad_multiplier: int = 128,
-    qkv_format: str = "thd",
+    data_iterator: "DataIterator", keys: Sequence[str], pad_multiplier: int = 128, qkv_format: str = "thd"
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -73,46 +49,10 @@ def get_batch(
     assert "tokens" in keys
     batch = data_iterator.get_next(keys)
 
-    # Lazily move this micro-batch's data from CPU to GPU.
-    # rollout_data is kept on CPU; only the current micro-batch lives on GPU.
-    for key in list(batch.keys()):
-        if batch[key] is not None:
-            batch[key] = _to_cuda(batch[key])
-
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
-    total_tokens_in_microbatch = sum(t.size(0) if isinstance(t, torch.Tensor) else len(t) for t in tokens)
-    sample_lens = [t.size(0) if isinstance(t, torch.Tensor) else len(t) for t in tokens]
-    mb_offset = data_iterator.offset - 1
-    has_indices = data_iterator.micro_batch_indices is not None
-    mb_indices = (
-        data_iterator.micro_batch_indices[mb_offset]
-        if has_indices and mb_offset < len(data_iterator.micro_batch_indices)
-        else None
-    )
-    logger.info(
-        "get_batch: offset=%d, %d samples, %d tokens, " "min/max/mean_len=%d/%d/%.0f, has_mb_indices=%s",
-        mb_offset,
-        len(tokens),
-        total_tokens_in_microbatch,
-        min(sample_lens) if sample_lens else 0,
-        max(sample_lens) if sample_lens else 0,
-        sum(sample_lens) / len(sample_lens) if sample_lens else 0,
-        has_indices,
-    )
-
-    _HARD_TOKEN_LIMIT = 100_000
-    if total_tokens_in_microbatch > _HARD_TOKEN_LIMIT:
-        raise RuntimeError(
-            f"FATAL: micro-batch at offset={mb_offset} has {total_tokens_in_microbatch} tokens "
-            f"(hard limit: {_HARD_TOKEN_LIMIT}). This will OOM in the model forward pass. "
-            f"num_samples={len(tokens)}, sample_lens={sample_lens[:30]}, "
-            f"has_micro_batch_indices={has_indices}, "
-            f"mb_indices={mb_indices[:20] if mb_indices and len(mb_indices) > 20 else mb_indices}, "
-            f"total_micro_batches={len(data_iterator.micro_batch_indices) if has_indices else 'N/A'}"
-        )
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
@@ -127,6 +67,7 @@ def get_batch(
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
+
     elif qkv_format == "thd":
         tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
 
@@ -170,7 +111,6 @@ def get_batch(
         strict=True,
     ):
         prompt_length = total_length - response_length
-        # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
         loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
         loss_mask = slice_with_cp(loss_mask, 0, qkv_format, max_seqlen)
         loss_masks.append(loss_mask)
@@ -369,17 +309,11 @@ def get_data_iterator(
     else:
         assert args.max_tokens_per_gpu is not None
         # calculate the number of mirobatches for each step
-        # Dynamic history may produce a local sample count not divisible by num_local_gbs.
-        # In that case, include one extra (tail) step so no sample is dropped.
-        dynamic_num_steps = num_steps_per_rollout + (1 if num_local_samples % num_local_gbs != 0 else 0)
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
         num_microbatches = []
-        for i in range(dynamic_num_steps):
-            start = i * num_local_gbs
-            end = min((i + 1) * num_local_gbs, num_local_samples)
-            if start >= end:
-                continue
+        for i in range(num_steps_per_rollout):
+            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             num_microbatches.append(
                 get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
             )
@@ -401,91 +335,15 @@ def get_data_iterator(
         # balance the number of mirobatches across steps
         micro_batch_indices = []
         for i, num_mbs in enumerate(num_microbatches):
-            start = i * num_local_gbs
-            end = min((i + 1) * num_local_gbs, num_local_samples)
-            if start >= end:
-                continue
+            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             samples = rollout_data["total_lengths"][start:end]
-            step_num_samples = end - start
-            if num_mbs > step_num_samples:
-                logger.warning(
-                    "Clipping num_microbatches from %d to %d for step %d "
-                    "(global-aligned microbatches exceed local samples).",
-                    num_mbs,
-                    step_num_samples,
-                    i,
-                )
-                num_mbs = step_num_samples
-                num_microbatches[i] = num_mbs
-
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start
             micro_batch_indices.extend(partitions)
 
-        flat_indices = sum(micro_batch_indices, [])
-        assert len(flat_indices) == num_local_samples and len(set(flat_indices)) == num_local_samples, (
-            f"micro_batch_indices mismatch: num_local_samples={num_local_samples}, "
-            f"flat_len={len(flat_indices)}, unique_len={len(set(flat_indices))}"
-        )
-
-        all_lengths = rollout_data["total_lengths"]
-        max_allowed_tokens = args.max_tokens_per_gpu * cp_size
-
-        # --- Safety: split any micro-batch whose packed tokens exceed the limit ---
-        orig_total_mbs = len(micro_batch_indices)
-        fixed_indices: list[list[int]] = []
-        fixed_num_microbatches: list[int] = []
-        mb_offset = 0
-        for step_num_mbs in num_microbatches:
-            step_fixed: list[list[int]] = []
-            for mb_i in range(step_num_mbs):
-                mb_idxs = micro_batch_indices[mb_offset + mb_i]
-                mb_tokens = sum(all_lengths[idx] for idx in mb_idxs)
-                if mb_tokens > max_allowed_tokens and len(mb_idxs) > 1:
-                    sub_batch: list[int] = []
-                    sub_tokens = 0
-                    for idx in mb_idxs:
-                        if sub_tokens + all_lengths[idx] > max_allowed_tokens and sub_batch:
-                            step_fixed.append(sub_batch)
-                            sub_batch = []
-                            sub_tokens = 0
-                        sub_batch.append(idx)
-                        sub_tokens += all_lengths[idx]
-                    if sub_batch:
-                        step_fixed.append(sub_batch)
-                else:
-                    step_fixed.append(mb_idxs)
-            fixed_indices.extend(step_fixed)
-            fixed_num_microbatches.append(len(step_fixed))
-            mb_offset += step_num_mbs
-
-        if len(fixed_indices) != orig_total_mbs:
-            logger.warning(
-                "Safety split: %d -> %d micro-batches (max_allowed=%d tokens). " "num_microbatches %s -> %s",
-                orig_total_mbs,
-                len(fixed_indices),
-                max_allowed_tokens,
-                num_microbatches,
-                fixed_num_microbatches,
-            )
-            micro_batch_indices = fixed_indices
-            num_microbatches = fixed_num_microbatches
-
-        max_mb_tokens = 0
-        for mb_idx, indices in enumerate(micro_batch_indices):
-            mb_tokens = sum(all_lengths[idx] for idx in indices)
-            max_mb_tokens = max(max_mb_tokens, mb_tokens)
-        logger.info(
-            "Dynamic batching: num_microbatches=%s, num_samples=%d, "
-            "sum_tokens=%d, max_tokens_per_microbatch=%d, max_tokens_per_gpu=%d",
-            num_microbatches,
-            num_local_samples,
-            sum(all_lengths),
-            max_mb_tokens,
-            args.max_tokens_per_gpu,
-        )
+        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
 
         data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
 
@@ -495,11 +353,7 @@ def get_data_iterator(
     )
 
 
-def log_rollout_data(
-    rollout_id: int,
-    args: Namespace,
-    rollout_data: RolloutBatch,
-) -> None:
+def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
     """
     Summarize rollout fields and log reduced metrics on PP last stage, TP rank 0.
 
@@ -522,44 +376,21 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
-                "group_indices",
                 "sample_indices",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
-                "step_wise_step_rewards",
-                "step_wise_step_token_spans",
-                "step_wise_step_indices",
-                "teacher_topk_log_probs",
-                "teacher_topk_indices",
-                "prm_teacher_topk_log_probs",
-                "prm_teacher_topk_indices",
-                "topk_log_probs",
-                "topk_indices",
-                "teacher_tokens",
-                "teacher_total_lengths",
             ]:
                 continue
             # Upload per sample mean for each rollout value
             # There are the following assumptions:
             # - Each dp rank has the same number of samples
             if isinstance(val, (list, tuple)):
-                if len(val) == 0:
-                    continue
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
-                    if key in [
-                        "log_probs",
-                        "ref_log_probs",
-                        "rollout_log_probs",
-                        "returns",
-                        "advantages",
-                        "values",
-                        "teacher_log_probs",
-                        "prm_teacher_log_probs",
-                    ]:
-                        val = torch.cat(val).clone().detach()
+                    val = torch.cat(val).clone().detach()
+                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
                         sum_of_sample_mean = get_sum_of_sample_mean(
                             total_lengths,
                             response_lengths,
@@ -569,18 +400,9 @@ def log_rollout_data(
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
-                        val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
                 else:
-                    if len(val) == 0:
-                        val = 0.0
-                    elif isinstance(val[0], (list, tuple)):
-                        # Some metadata fields are nested lists (e.g. step-wise indices).
-                        # Flatten one level and only average numeric values for logging.
-                        flat_val = [item for sub in val for item in sub if isinstance(item, (int, float, np.number))]
-                        val = (sum(flat_val) / len(flat_val)) if flat_val else 0.0
-                    else:
-                        val = sum(val) / len(val)
+                    val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:

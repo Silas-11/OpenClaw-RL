@@ -11,10 +11,12 @@ from .hf_weight_iterator_base import HfWeightIteratorBase
 class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._bridge, _, _ = megatron_bridge_utils.build_bridge_for_hf_checkpoint(
-            self.args.hf_checkpoint,
-            load_weights=False,
-        )
+
+        from megatron.bridge import AutoBridge
+
+        import slime_plugins.megatron_bridge  # noqa: F401
+
+        self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
