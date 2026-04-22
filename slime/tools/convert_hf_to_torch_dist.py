@@ -4,91 +4,21 @@ import shutil
 
 import torch
 import torch.distributed as dist
+from slime.utils.common import is_npu
+if is_npu():
+    import mindspeed.megatron_adaptor
+    from mindspeed.megatron_adaptor import repatch
 from megatron.core.enums import ModelType
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
 from megatron.training.training import get_model
-
-import slime_plugins.mbridge  # noqa: F401
 from mbridge import AutoBridge
+import slime_plugins.mbridge  # noqa: F401
 from slime.backends.megatron_utils.arguments import set_default_megatron_args
 from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import print_memory
-
-
-def apply_safe_qwen3vl_mapping_filter(bridge):
-    """Patch qwen3_vl bridge in-process to skip known non-parameter buffers only."""
-    hf_model_type = getattr(getattr(bridge, "hf_config", None), "model_type", None)
-    if hf_model_type != "qwen3_vl":
-        return
-
-    original_local_to_global = bridge._weight_name_mapping_mcore_local_to_global
-    original_map_mcore_to_hf = bridge._weight_name_mapping_mcore_to_hf
-    original_weight_to_mcore = bridge._weight_to_mcore_format
-
-    def normalize_qwen3vl_key(global_name: str) -> str:
-        # Some Megatron builds expose language keys without "language_model." prefix.
-        if global_name.startswith(("embedding.", "decoder.", "output_layer.")):
-            return f"language_model.{global_name}"
-        return global_name
-
-    def wrapped_local_to_global(*args, **kwargs):
-        local_to_global_map = original_local_to_global(*args, **kwargs)
-        filtered = {}
-        skipped_non_param_keys = []
-        normalized_key_pairs = []
-        for local_name, global_name in local_to_global_map.items():
-            normalized_name = normalize_qwen3vl_key(global_name)
-            if normalized_name != global_name:
-                normalized_key_pairs.append((global_name, normalized_name))
-
-            # Skip known runtime-only rotary buffer keys.
-            if normalized_name.endswith(".inv_freq"):
-                skipped_non_param_keys.append(normalized_name)
-                continue
-            if (
-                len(normalized_name.split(".")) < 4
-                and normalized_name not in bridge._DIRECT_MAPPING
-            ):
-                raise RuntimeError(
-                    "Found malformed qwen3_vl key after normalization: "
-                    f"original='{global_name}', normalized='{normalized_name}'."
-                )
-            filtered[local_name] = normalized_name
-
-        if skipped_non_param_keys and (not dist.is_initialized() or dist.get_rank() == 0):
-            preview = ", ".join(skipped_non_param_keys[:4])
-            if len(skipped_non_param_keys) > 4:
-                preview += ", ..."
-            print(
-                "convert_hf_to_torch_dist: skipped non-parameter keys "
-                f"({len(skipped_non_param_keys)}): {preview}"
-            )
-        if normalized_key_pairs and (not dist.is_initialized() or dist.get_rank() == 0):
-            preview = ", ".join([f"{a}->{b}" for a, b in normalized_key_pairs[:4]])
-            if len(normalized_key_pairs) > 4:
-                preview += ", ..."
-            print(
-                "convert_hf_to_torch_dist: normalized qwen3_vl keys "
-                f"({len(normalized_key_pairs)}): {preview}"
-            )
-
-        return filtered
-
-    def wrapped_map_mcore_to_hf(mcore_weights_name):
-        return original_map_mcore_to_hf(normalize_qwen3vl_key(mcore_weights_name))
-
-    def wrapped_weight_to_mcore_format(mcore_weights_name, hf_weights):
-        return original_weight_to_mcore(
-            normalize_qwen3vl_key(mcore_weights_name), hf_weights
-        )
-
-    bridge._weight_name_mapping_mcore_local_to_global = wrapped_local_to_global
-    bridge._weight_name_mapping_mcore_to_hf = wrapped_map_mcore_to_hf
-    bridge._weight_to_mcore_format = wrapped_weight_to_mcore_format
-
 
 def add_convertion_args(parser):
     """Add conversion arguments to the parser"""
@@ -164,20 +94,32 @@ def main():
     local_rank = int(os.getenv("LOCAL_RANK") or os.getenv("SLURM_LOCALID") or 0)
     global_rank = int(os.getenv("RANK") or os.getenv("SLURM_PROCID") or 0)
 
-    torch.cuda.set_device(local_rank)
+    if is_npu():
+        torch.npu.set_device(local_rank)
+    else:
+        torch.cuda.set_device(local_rank)
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("RANK", str(global_rank))
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
-    dist.init_process_group(
-        backend="nccl",
-        world_size=world_size,
-        rank=global_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+    if is_npu():
+        dist.init_process_group(
+            backend="hccl",
+            world_size=world_size,
+            rank=global_rank,
+        )
+    else:
+        dist.init_process_group(
+            backend="nccl",
+            world_size=world_size,
+            rank=global_rank,
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
     args = get_args()
     init(args)
+    if is_npu():
+        repatch(args)
 
     # if using AMD gpus, we have to do the conversion in cpu
     if hasattr(torch.version, "hip") and torch.version.hip is not None:
@@ -188,7 +130,6 @@ def main():
     # Load model
     hf_model_path = args.hf_checkpoint
     bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
-    apply_safe_qwen3vl_mapping_filter(bridge)
     bridge.load_weights(model, hf_model_path, memory_efficient=True)
     print(f"Model loaded: {hf_model_path}")
 
