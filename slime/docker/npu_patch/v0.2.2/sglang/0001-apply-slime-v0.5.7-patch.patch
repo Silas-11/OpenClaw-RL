@@ -1,3 +1,46 @@
+From d49600b10b781f427cde727fb8b2004120d2eabe Mon Sep 17 00:00:00 2001
+From: zjchenn <zjchenn@gmail.com>
+Date: Tue, 17 Mar 2026 16:43:56 +0800
+Subject: [PATCH 01/11] apply slime v0.5.7 patch
+
+---
+ python/sglang/srt/configs/model_config.py     |  6 ++
+ python/sglang/srt/disaggregation/decode.py    |  7 ++
+ .../srt/disaggregation/mooncake/conn.py       | 13 +++
+ python/sglang/srt/disaggregation/prefill.py   |  7 ++
+ .../sglang/srt/distributed/parallel_state.py  |  5 +-
+ python/sglang/srt/entrypoints/engine.py       | 19 ++++
+ python/sglang/srt/entrypoints/http_server.py  | 16 ++++
+ .../srt/layers/attention/nsa/nsa_indexer.py   |  9 +-
+ python/sglang/srt/layers/layernorm.py         | 28 +++---
+ python/sglang/srt/layers/logits_processor.py  |  5 -
+ .../layers/moe/fused_moe_triton/fused_moe.py  |  6 +-
+ .../srt/layers/moe/routed_experts_capturer.py | 27 +++++-
+ .../compressed_tensors_moe.py                 | 51 +++++++++--
+ python/sglang/srt/layers/rotary_embedding.py  |  7 +-
+ python/sglang/srt/layers/sampler.py           | 11 +--
+ python/sglang/srt/managers/io_struct.py       | 13 +++
+ python/sglang/srt/managers/schedule_batch.py  |  3 +-
+ python/sglang/srt/managers/scheduler.py       |  2 +
+ .../scheduler_output_processor_mixin.py       |  3 +-
+ .../scheduler_update_weights_mixin.py         | 25 +++++
+ .../managers/tokenizer_communicator_mixin.py  | 20 ++++
+ python/sglang/srt/managers/tp_worker.py       |  6 ++
+ python/sglang/srt/mem_cache/memory_pool.py    |  3 +-
+ .../sglang/srt/model_executor/model_runner.py | 56 ++++++++++--
+ python/sglang/srt/models/deepseek_v2.py       |  6 +-
+ python/sglang/srt/models/qwen2.py             | 12 +--
+ python/sglang/srt/models/qwen2_moe.py         | 12 ++-
+ python/sglang/srt/models/qwen3.py             |  6 +-
+ python/sglang/srt/models/qwen3_moe.py         | 50 ++++++++--
+ python/sglang/srt/models/qwen3_vl.py          | 91 ++++++++++++++-----
+ python/sglang/srt/server_args.py              |  6 ++
+ .../eagle_draft_cuda_graph_runner.py          |  9 +-
+ python/sglang/srt/speculative/eagle_info.py   | 25 +++++
+ python/sglang/srt/speculative/eagle_worker.py |  2 +-
+ python/sglang/srt/utils/common.py             |  2 +
+ 35 files changed, 472 insertions(+), 97 deletions(-)
+
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
 index aa10cb08d..d41c31a09 100644
 --- a/python/sglang/srt/configs/model_config.py
@@ -1288,3 +1331,6 @@ index 8560246c6..13db860dc 100644
      }
  
      DENY_CLASSES = {
+-- 
+2.33.0
+
